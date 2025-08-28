@@ -1,5 +1,0 @@
-STATUS: 500
-TEXTO : {
-  "faultstring": "ERROR: Tag [DEMIFINAL] não faz parte da estrutura do tipo complexo [nfeListarRequest]!",
-  "faultcode": "SOAP-ENV:Client-5001"
-}
