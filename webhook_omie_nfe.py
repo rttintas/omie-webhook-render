@@ -3,29 +3,19 @@ import json
 from fastapi import FastAPI, Request, HTTPException
 from typing import Optional
 
-# Inicializa o aplicativo FastAPI
 app = FastAPI()
 
-# Configuração do banco de dados (desativada para teste)
-#
-# @app.on_event("startup")
-# async def startup():
-#     pass
-#
-# @app.on_event("shutdown")
-# async def shutdown():
-#     pass
+@app.get("/")
+async def read_root():
+    return {"status": "ok", "message": "Serviço está no ar!"}
 
-# Rota para receber os webhooks da Omie
 @app.post("/omie/webhook")
 async def omie_webhook(request: Request, token: Optional[str] = None):
     # ATENÇÃO: ESTE É UM CÓDIGO TEMPORÁRIO PARA DIAGNÓSTICO
-    # Ele desativa a validação de segurança para podermos ver o log.
+    # Ele não se conecta a nada e não salva nada no banco de dados.
     
-    # Este trecho irá imprimir os tokens nos seus logs
     print(f"Token recebido na URL: '{token}'")
     
-    # Tente ler o payload como JSON
     try:
         payload = await request.json()
     except:
@@ -37,4 +27,4 @@ async def omie_webhook(request: Request, token: Optional[str] = None):
     # if token != os.environ.get("WEBHOOK_TOKEN"):
     #    raise HTTPException(status_code=401, detail="Token de autenticação inválido.")
 
-    return {"status": "success", "message": "Webhook recebido com sucesso. Validação de token desativada para diagnóstico."}
+    return {"status": "success", "message": "Webhook recebido com sucesso. Sem validação de token e sem banco de dados."}
