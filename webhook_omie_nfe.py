@@ -22,7 +22,7 @@ async def shutdown():
     await db_pool.close()
 
 # Rota para receber os webhooks da Omie
-@app.post("/omie/webhook/{token}")
+@app.post("/omie/webhook")
 async def omie_webhook(request: Request, token: str):
     # 1. Validação do token de segurança
     if token != os.environ.get("OMIE_WEBHOOK_TOKEN"):
