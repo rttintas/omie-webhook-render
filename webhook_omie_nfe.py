@@ -25,8 +25,8 @@ async def shutdown():
 @app.post("/omie/webhook")
 async def omie_webhook(request: Request, token: str):
     # 1. Validação do token de segurança
-    # if token != os.environ.get("OMIE_WEBHOOK_TOKEN"):
-    #   raise HTTPException(status_code=401, detail="Token de autenticação inválido.")
+      if token != os.environ.get("OMIE_WEBHOOK_TOKEN"):
+        raise HTTPException(status_code=401, detail="Token de autenticação inválido.")
 
     try:
         # 2. Recebe e desserializa o payload JSON
