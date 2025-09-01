@@ -1,53 +1,52 @@
-# ---------- webhook ----------
+# Rota para receber os webhooks da Omie
 @app.post("/omie/webhook")
-async def omie_webhook(
-    request: Request,
-    token: Optional[str] = Query(None, description="Token simples via querystring")
-):
-    # ATENÇÃO: ESTE É UM CÓDIGO TEMPORÁRIO PARA DIAGNÓSTICO
-    # Ele desativa a validação de segurança. NÃO USE EM PRODUÇÃO.
-    
-    # 1. Este trecho irá imprimir os tokens nos seus logs
-    print(f"Token recebido na URL: '{token}'")
-    print(f"Token esperado: '{os.environ.get('WEBHOOK_TOKEN')}'")
-
-    # 2. Desativa temporariamente a validação. O status será sempre 200.
-    # if os.environ.get("WEBHOOK_TOKEN") and token != os.environ.get("WEBHOOK_TOKEN"):
-    #     raise HTTPException(status_code=401, detail="Token inválido")
-
-    # O resto do código continua igual.
-    try:
-        body = await request.json()
-        if not isinstance(body, dict):
-            body = {"_raw": body}
-    except Exception:
-        raw = (await request.body()).decode("utf-8", errors="ignore")
-        body = {"_raw": raw}
-    
-    event_type = _extract_event_type(body)
-    event_id = body.get("event_id") or body.get("id") or body.get("guid") or _hash_event(body)
-    headers = dict(request.headers)
-
-    if not _pool:
-        return {"ok": True, "warning": "PG_DSN ausente; evento não foi persistido", "event_type": event_type}
+async def omie_webhook(request: Request, token: str):
+    # 1. Validação do token de segurança
+    # Esta linha ainda precisa do sinal de jogo da velha, pois a validação foi desativada no código.
+    # if token != os.environ.get("OMIE_WEBHOOK_TOKEN"):
+    #     raise HTTPException(status_code=401, detail="Token de autenticação inválido.")
 
     try:
-        async with _pool.acquire() as con:
-            await con.execute(
-                """
-                INSERT INTO public.omie_webhook_events
-                    (received_at, event_type, event_id, payload, raw_headers, http_status)
-                VALUES
-                    (now(), $1, $2, $3::jsonb, $4::jsonb, 200)
-                """,
-                event_type,
-                event_id,
-                json.dumps(body, ensure_ascii=False),
-                json.dumps(headers, ensure_ascii=False),
-            )
-        return {"ok": True, "event_type": event_type, "stored": True}
+        # 2. Recebe e desserializa o payload JSON
+        payload = await request.json()
+        print(f"Payload recebido: {json.dumps(payload, indent=2)}")
+
+        # 3. Identifica o evento do webhook
+        evento = payload.get('evento')
+        
+        # 4. Processa o evento de Nota Fiscal
+        if evento == "nfe.faturada":
+            numero_nf = payload['nfe']['numero']
+            raw_data = json.dumps(payload)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO public.omie_nfe (numero, raw)
+                    VALUES ($1, $2)
+                    ON CONFLICT (numero) DO UPDATE SET raw = EXCLUDED.raw;
+                    """,
+                    numero_nf, raw_data
+                )
+            return {"status": "success", "message": f"Nota Fiscal {numero_nf} salva com sucesso."}
+
+        # 5. Processa o evento de Pedido de Venda
+        elif evento == "venda.produto.faturado" or evento == "venda.produto.alterada":
+            numero_pedido = payload['cabecalho']['numero_pedido']
+            raw_data = json.dumps(payload)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO public.omie_pedido (numero_pedido, raw)
+                    VALUES ($1, $2)
+                    ON CONFLICT (numero_pedido) DO UPDATE SET raw = EXCLUDED.raw;
+                    """,
+                    numero_pedido, raw_data
+                )
+            return {"status": "success", "message": f"Pedido de Venda {numero_pedido} salvo com sucesso."}
+
+        # 6. Lida com eventos não suportados
+        else:
+            return {"status": "ignored", "message": f"Tipo de evento '{evento}' não suportado."}
     except Exception as e:
-        return JSONResponse(
-            {"ok": True, "event_type": event_type, "stored": False, "error": str(e)[:300]},
-            status_code=200,
-        )
+        print(f"Erro ao processar o webhook: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno do servidor.")
