@@ -58,7 +58,7 @@ async def omie_webhook(request: Request, token: str):
                 return {"status": "success", "message": f"Nota Fiscal {numero_nf} salva com sucesso."}
 
         # Processa o evento de Pedido de Venda
-        elif evento_topic in ("vendaproduto.faturada", "vendaproduto.etapaalterada", "vendaproduto.incluida"):
+        elif evento_topic in ("vendaproduto.faturada", "vendaproduto.etapaalterada", "vendaproduto.incluida", "vendaproduto.alterada"):
             numero_pedido = evento_data.get('numeroPedido')
             raw_data = json.dumps(payload)
             if numero_pedido and _pool:
