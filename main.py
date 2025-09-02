@@ -1,271 +1,189 @@
-# main.py
 import os
 import json
 import asyncio
-from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import asyncpg
-import httpx
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
 APP_NAME = "omie-webhook-render"
 
-# ====== CONFIG ======
-DATABASE_URL = os.getenv("DATABASE_URL")
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "um-segredo-forte")
-POOL_MIN = int(os.getenv("POOL_MIN", "1"))
-POOL_MAX = int(os.getenv("POOL_MAX", "5"))
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
-
-if not DATABASE_URL:
-    raise RuntimeError("Faltou DATABASE_URL no ambiente.")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
 
 app = FastAPI(title=APP_NAME)
-pool: asyncpg.Pool | None = None
+pool: Optional[asyncpg.Pool] = None
 
 
-# ====== UTIL ======
-def now_tz() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-async def fetch_text(url: str) -> str | None:
-    """Baixa texto (XML) se a URL estiver acessível; senão, retorna None."""
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            return r.text
-    except Exception:
-        return None
-
-
-# ====== STARTUP / SHUTDOWN ======
-@app.on_event("startup")
-async def _startup() -> None:
+# ------------- util ------------- #
+async def get_pool() -> asyncpg.Pool:
     global pool
-    pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=POOL_MIN,
-        max_size=POOL_MAX,
-        command_timeout=60,
-    )
-    # ping simples
-    async with pool.acquire() as con:
-        val = await con.fetchval("SELECT 1;")
-        if val != 1:
-            raise RuntimeError("Falha no ping do banco.")
-    print("INFO: Pool OK & schema verificado.")
+    if pool is None:
+        # Render/Neon normalmente exigem SSL.
+        pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            command_timeout=60,
+            ssl="require"
+        )
+        # valida conexão e esquema
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1;")
+    return pool
 
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    global pool
-    if pool:
-        await pool.close()
-        pool = None
+async def detect_xml_column(conn: asyncpg.Connection) -> str:
+    """
+    Descobre se a coluna na tabela public.omie_nfe_xml chama 'xml' ou 'nfe_xml'.
+    Default: 'xml'.
+    """
+    rows = await conn.fetch("""
+        select column_name
+        from information_schema.columns
+        where table_schema='public'
+          and table_name='omie_nfe_xml'
+          and column_name in ('xml','nfe_xml')
+        order by case when column_name='xml' then 0 else 1 end
+        limit 1;
+    """)
+    return rows[0]["column_name"] if rows else "xml"
 
 
-# ====== HEALTH ======
+def get_json_field(data: Dict[str, Any], *caminhos, default=None):
+    """
+    Busca um campo em diferentes caminhos/chaves.
+    Ex.: get_json_field(payload, ("evento","numero_nf"), ("evento","numeroNf"))
+    """
+    for path in caminhos:
+        cur = data
+        try:
+            for k in path:
+                cur = cur[k]
+            if cur is not None:
+                return cur
+        except Exception:
+            pass
+    return default
+
+
+# ------------- health ------------- #
 @app.get("/health/app")
 async def health_app():
     return {"ok": True, "name": APP_NAME}
 
-
 @app.get("/health/db")
 async def health_db():
-    async with pool.acquire() as con:
-        v = await con.fetchval("SELECT 1;")
-    return {"db": "ok", "select1": v}
+    p = await get_pool()
+    async with p.acquire() as conn:
+        row = await conn.fetchrow("select 1 as select1;")
+        return {"db": "ok", "select1": row["select1"]}
 
 
-# ====== PARSERS DE PAYLOAD ======
-def _get(d: dict, *path, default=None):
-    cur = d
-    for k in path:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
-
-
-def parse_payload(body: dict) -> dict:
-    """
-    Normaliza o payload em um dicionário com:
-      kind: "pedido" | "nfe"
-      numero_pedido: str | None
-      numero_nf: str | None
-      chave_nfe: str | None
-      xml_url: str | None
-    Suporta:
-      - Formato Omie (topic + evento)
-      - Formato "cru" com campos no topo
-    """
-    topic = body.get("topic") or body.get("tipo") or ""
-
-    # Tentativas diretas do 'evento'
-    ev = body.get("evento") if isinstance(body.get("evento"), dict) else {}
-    numero_pedido = (
-        _get(body, "numeroPedido")
-        or _get(ev, "numeroPedido")
-        or _get(body, "pedido", "numero")
-    )
-    numero_nf = (
-        _get(body, "numero_nf")
-        or _get(ev, "numero_nf")
-        or _get(body, "nfe", "numero")
-    )
-    chave_nfe = (
-        _get(body, "nfe_chave")
-        or _get(ev, "nfe_chave")
-        or _get(body, "chave_nfe")
-        or _get(ev, "chave_nfe")
-    )
-    xml_url = (
-        _get(body, "nfe_xml")
-        or _get(ev, "nfe_xml")
-        or _get(body, "xml_url")
-        or _get(ev, "xml_url")
-    )
-
-    # Determinar kind
-    kind = None
-    t = str(topic).lower()
-    if "vendaproduto" in t:
-        kind = "pedido"
-    elif "nfe.notaautorizada" in t or "nfe" in t:
-        kind = "nfe"
-    # fallback por presença de campos
-    if kind is None:
-        if numero_pedido:
-            kind = "pedido"
-        elif numero_nf or chave_nfe or xml_url:
-            kind = "nfe"
-
-    return {
-        "kind": kind,
-        "numero_pedido": str(numero_pedido) if numero_pedido else None,
-        "numero_nf": str(numero_nf) if numero_nf else None,
-        "chave_nfe": str(chave_nfe) if chave_nfe else None,
-        "xml_url": str(xml_url) if xml_url else None,
-    }
-
-
-# ====== UPSERTS ======
-async def upsert_pedido(numero_pedido: str) -> None:
-    """
-    Grava/atualiza pedido em public.omie_pedido.
-    Requer UNIQUE(numero) já criado (uQ_omie_pedido_numero).
-    """
-    sql = """
-        INSERT INTO public.omie_pedido (numero, recebido_em)
-        VALUES ($1, now())
-        ON CONFLICT (numero) DO UPDATE
-           SET recebido_em = EXCLUDED.recebido_em;
-    """
-    async with pool.acquire() as con:
-        await con.execute(sql, numero_pedido)
-
-
-async def upsert_nfe(
-    *,
-    numero_nf: str | None,
-    chave_nfe: str | None,
-    xml_text: str | None,
-) -> None:
-    """
-    Grava/atualiza capa da NFe em public.omie_nfe usando a coluna **xml**.
-    Usa ON CONFLICT por (chave_nfe) se existir; senão, por (numero).
-    Também grava em public.omie_nfe_xml (chave_nfe, xml) se houver chave.
-    """
-    async with pool.acquire() as con:
-        async with con.transaction():
-            if chave_nfe:
-                # upsert por chave_nfe
-                sql_chave = """
-                    INSERT INTO public.omie_nfe
-                        (chave_nfe, numero, xml, updated_at, recebido_em)
-                    VALUES ($1, $2, $3, now(), now())
-                    ON CONFLICT (chave_nfe) DO UPDATE SET
-                        numero = COALESCE(EXCLUDED.numero, public.omie_nfe.numero),
-                        xml    = COALESCE(EXCLUDED.xml, public.omie_nfe.xml),
-                        updated_at = now();
-                """
-                await con.execute(sql_chave, chave_nfe, numero_nf, xml_text)
-            elif numero_nf:
-                # upsert por numero (precisa de UNIQUE(numero))
-                sql_numero = """
-                    INSERT INTO public.omie_nfe
-                        (numero, xml, updated_at, recebido_em)
-                    VALUES ($1, $2, now(), now())
-                    ON CONFLICT (numero) DO UPDATE SET
-                        xml = COALESCE(EXCLUDED.xml, public.omie_nfe.xml),
-                        updated_at = now();
-                """
-                await con.execute(sql_numero, numero_nf, xml_text)
-
-            # Guarda XML completo em tabela dedicada (se souber a chave)
-            if chave_nfe and xml_text:
-                sql_xml = """
-                    INSERT INTO public.omie_nfe_xml (chave_nfe, xml, recebido_em)
-                    VALUES ($1, $2, now())
-                    ON CONFLICT (chave_nfe) DO UPDATE SET
-                        xml = EXCLUDED.xml,
-                        recebido_em = now();
-                """
-                await con.execute(sql_xml, chave_nfe, xml_text)
-
-
-# ====== WEBHOOK ======
+# ------------- webhook ------------- #
 @app.post("/omie/webhook")
-async def omie_webhook(
-    request: Request,
-    token: str = Query(None, alias="token"),
-):
-    # Autorização simples por token de querystring
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido.")
-
+async def omie_webhook(request: Request, token: Optional[str] = None):
+    # se você quiser, valide o token aqui
     try:
-        body = await request.json()
+        payload = await request.json()
     except Exception:
-        body = {}
+        raise HTTPException(status_code=400, detail="JSON inválido")
 
-    if not isinstance(body, dict) or not body:
-        # Log leve para diagnóstico
-        print("INFO: Recebida chamada com payload inválido/vazio.")
-        raise HTTPException(status_code=400, detail="Payload inválido")
+    # Alguns provedores mandam string JSON dentro de string
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            pass
 
-    print(f"INFO: Payload recebido: {json.dumps(body, ensure_ascii=False)}")
+    topic = get_json_field(payload, ("topic",), ("assunto",), default=None)
+    evento: Dict[str, Any] = get_json_field(payload, ("evento",), default={})
+    message_id = get_json_field(payload, ("messageId",), ("idMensagem",), default="-")
 
-    event = parse_payload(body)
-    kind = event.get("kind")
+    p = await get_pool()
+    async with p.acquire() as conn:
+        # importante: cada chamada com sua transação
+        async with conn.transaction():
+            if topic == "VendaProduto.Incluida":
+                numero_pedido = get_json_field(
+                    payload, ("evento", "numeroPedido"), ("evento", "numero_pedido")
+                )
+                if not numero_pedido:
+                    raise HTTPException(status_code=400, detail="numeroPedido ausente")
 
-    if kind == "pedido":
-        numero_pedido = event.get("numero_pedido")
-        if not numero_pedido:
-            raise HTTPException(status_code=400, detail="numeroPedido ausente")
-        await upsert_pedido(numero_pedido)
-        return {"status": "success", "message": f"Pedido {numero_pedido} salvo/atualizado."}
+                # upsert de pedido (NENHUM XML AQUI)
+                await conn.execute(
+                    """
+                    insert into public.omie_pedido (numero, recebido_em)
+                    values ($1, timezone('UTC', now()))
+                    on conflict (numero) do update
+                       set recebido_em = excluded.recebido_em,
+                           updated_at  = timezone('UTC', now());
+                    """,
+                    str(numero_pedido),
+                )
+                return JSONResponse(
+                    {"status": "success", "message": f"Pedido {numero_pedido} salvo/atualizado."}
+                )
 
-    if kind == "nfe":
-        numero_nf = event.get("numero_nf")
-        chave_nfe = event.get("chave_nfe")
-        xml_url = event.get("xml_url")
+            elif topic == "NFe.NotaAutorizada":
+                # dados que podem vir
+                numero_nf = get_json_field(evento, ("numero_nf",), ("numeroNf",))
+                chave_nfe = get_json_field(evento, ("chave_nfe",), ("chaveNfe",), ("chave",))
+                emitida_em = get_json_field(evento, ("emitida_em",), ("emitidaEm",))
+                # XML pode vir com nomes diferentes
+                xml_body = get_json_field(evento, ("xml",), ("nfe_xml",), ("nfeXml",))
 
-        xml_text = None
-        if xml_url:
-            xml_text = await fetch_text(xml_url)
+                # 1) Salva/atualiza metadados de NF na omie_nfe (NADA de XML aqui)
+                if numero_nf:
+                    await conn.execute(
+                        """
+                        insert into public.omie_nfe (numero, recebido_em, updated_at)
+                        values ($1, timezone('UTC', now()), timezone('UTC', now()))
+                        on conflict (numero) do update
+                           set recebido_em = excluded.recebido_em,
+                               updated_at  = excluded.updated_at;
+                        """,
+                        str(numero_nf),
+                    )
 
-        await upsert_nfe(numero_nf=numero_nf, chave_nfe=chave_nfe, xml_text=xml_text)
-        msg_id = chave_nfe or numero_nf or "-"
-        return {"status": "success", "message": f"NF {msg_id} salva/atualizada."}
+                if chave_nfe:
+                    # Se já houver chave e a linha existir, completa/atualiza outros campos
+                    await conn.execute(
+                        """
+                        insert into public.omie_nfe (chave_nfe, emitida_em, recebido_em, updated_at, numero)
+                        values ($1, $2, timezone('UTC', now()), timezone('UTC', now()), $3)
+                        on conflict (chave_nfe) do update
+                           set emitida_em = coalesce(excluded.emitida_em, public.omie_nfe.emitida_em),
+                               numero     = coalesce(excluded.numero, public.omie_nfe.numero),
+                               recebido_em = excluded.recebido_em,
+                               updated_at  = excluded.updated_at;
+                        """,
+                        str(chave_nfe),
+                        emitida_em,
+                        str(numero_nf) if numero_nf else None,
+                    )
 
-    # Sem match
-    return {"status": "ignored", "message": "Evento não reconhecido."}
+                # 2) Se houver XML e chave, salva na omie_nfe_xml
+                if xml_body and chave_nfe:
+                    xml_col = await detect_xml_column(conn)  # 'xml' ou 'nfe_xml'
+                    # monta SQL dinamicamente APENAS para a tabela de XML
+                    sql = f"""
+                        insert into public.omie_nfe_xml (chave_nfe, {xml_col}, recebido_em)
+                        values ($1, $2, timezone('UTC', now()))
+                        on conflict (chave_nfe) do update
+                           set {xml_col}  = excluded.{xml_col},
+                               recebido_em = excluded.recebido_em;
+                    """
+                    await conn.execute(sql, str(chave_nfe), str(xml_body))
 
+                return JSONResponse(
+                    {"status": "success", "message": f"NF {numero_nf or chave_nfe or ''} salva/atualizada."}
+                )
 
-# ====== RAIZ ======
-@app.get("/")
-async def root():
-    return {"ok": True, "app": APP_NAME}
+            else:
+                # tópico que não mapeamos
+                return JSONResponse({"status": "ignored", "topic": topic or "desconhecido"})
+
+    # fallback
+    return {"ok": True, "messageId": message_id}
