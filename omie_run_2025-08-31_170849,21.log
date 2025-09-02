@@ -1,0 +1,35 @@
+================================================ 
+[Python ] "C:\Program Files\Python310\python.exe"                          
+[Script ] "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py"                            
+================================================ 
+
+Iniciando carga Omie - 31/08/2025 17:08:49,33 
+================================================
+[Python ] "C:\Program Files\Python310\python.exe"
+[Script ] "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py"
+================================================
+
+Iniciando carga Omie - 31/08/2025 17:08:49,586
+================================================
+[Python ] "C:\Program Files\Python310\python.exe"
+[Script ] "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py"
+================================================
+
+Iniciando carga Omie…
+================================================
+
+Baixando PEDIDOS…
+
+ERRO durante a carga: RuntimeError('Defina DATABASE_URL no ambiente.')
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 459, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 451, in main
+    persistir_pedido_normalizado(norm)
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 346, in persistir_pedido_normalizado
+    raise RuntimeError("Defina DATABASE_URL no ambiente.")
+RuntimeError: Defina DATABASE_URL no ambiente.
+
+================================================ 
+Encerrado em 31/08/2025 17:08:54,93 (exit code 1) 
+================================================ 

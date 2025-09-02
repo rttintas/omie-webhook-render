@@ -1,0 +1,35 @@
+================================================ 
+[Python ] "C:\Program Files\Python310\python.exe"                          
+[Script ] "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py"                            
+================================================ 
+
+Iniciando carga Omie - 31/08/2025 16:51:56,88 
+================================================
+[Python ] "C:\Program Files\Python310\python.exe"
+[Script ] "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py"
+================================================
+
+Iniciando carga Omie - 31/08/2025 16:51:57,218
+================================================
+[Python ] "C:\Program Files\Python310\python.exe"
+[Script ] "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py"
+================================================
+
+Iniciando carga Omie…
+================================================
+
+Baixando PEDIDOS…
+
+ERRO durante a carga: ModuleNotFoundError("No module named 'psycopg'")
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 449, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 441, in main
+    persistir_pedido_normalizado(norm)
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 334, in persistir_pedido_normalizado
+    import psycopg
+ModuleNotFoundError: No module named 'psycopg'
+
+================================================ 
+Encerrado em 31/08/2025 16:52:04,53 (exit code 1) 
+================================================ 

@@ -1,0 +1,30 @@
+=======================================================
+[Python ] C:\Program Files\Python310\python.exe
+[Script ] G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py
+=======================================================
+
+Iniciando carga Omie…
+=======================================================
+
+Baixando PEDIDOS…
+
+==============================================================
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 485, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 444, in main
+    norm = norm_pedido(raw)
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 258, in norm_pedido
+    "itens": norm_itens(id_pedido, raw),
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 268, in norm_itens
+    produtos = det.get("produto") or det.get("produtos") or []
+AttributeError: 'list' object has no attribute 'get'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 489, in <module>
+    print("\u274c  ERRO durante a carga:", repr(e))
+  File "C:\Program Files\Python310\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\u274c' in position 0: character maps to <undefined>

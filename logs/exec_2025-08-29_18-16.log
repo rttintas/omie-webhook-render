@@ -1,0 +1,12 @@
+== Início: 2025-08-29 18:16:00.253922 ==
+[INFO] 2025-08-29 18:16:00.275957  Lendo PDFs em: G:\Meu Drive\Produção Ecommerce\Entrada Pdfs
+[INFO] 2025-08-29 18:16:00.282440  NF(s) detectadas (>=100KB): ['00009311', '00009304']
+[ERRO] 2025-08-29 18:16:00.431267  Erro em 2025-08-29 18:16:00.431267:
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 338, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 313, in main
+    rows, aggs = buscar_dados(nfs)
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 167, in buscar_dados
+    raise RuntimeError("A view public.vw_nf_pedido não possui: " + ", ".join(faltando))
+RuntimeError: A view public.vw_nf_pedido não possui: pedido_id, cliente

@@ -1,0 +1,18 @@
+==== Inicio: 29/08/2025 15:57:45,59 ==== 
+NFs detectadas pelos PDFs (>=100 KB): [9304, 9311]
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 118, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 95, in main
+    rows, aggs = buscar_dados(nf_list)
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 48, in buscar_dados
+    rows = query_dicts(sql, {"nfs": nf_list})
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\util_db.py", line 21, in query_dicts
+    cur.execute(sql, params or {})
+  File "C:\Users\Natalia\AppData\Roaming\Python\Python310\site-packages\psycopg2\extras.py", line 236, in execute
+    return super().execute(query, vars)
+psycopg2.errors.UndefinedTable: ERRO:  não existe a relação "public.vw_nf_pedido_expandida"
+LINE 6:         FROM public.vw_nf_pedido_expandida v
+                     ^
+
+==== Fim: 29/08/2025 15:57:46,14 ==== 

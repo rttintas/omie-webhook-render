@@ -1,0 +1,7 @@
+[2025-08-29 18:59:54.800] == Início ==
+[2025-08-29 18:59:54.828] Lendo PDFs em: G:\Meu Drive\Produção Ecommerce\Entrada Pdfs
+[2025-08-29 18:59:54.864] NF(s) detectadas (>=100KB): ['00009311', '00009304']
+[2025-08-29 18:59:55.583] [ERRO] Falha na consulta à view public.vw_nf_pedido_std: relation "public.vw_nf_pedido_std" does not exist
+LINE 9:         FROM public.vw_nf_pedido_std v
+                     ^
+

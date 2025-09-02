@@ -1,0 +1,13 @@
+================================================== 
+Iniciando carga Omie -  31/08/2025 11:38:28,44 
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\load_omie_batch.py", line 210, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\load_omie_batch.py", line 151, in main
+    conn = psycopg2.connect(PG_DSN)
+  File "C:\Users\Natalia\AppData\Roaming\Python\Python310\site-packages\psycopg2\__init__.py", line 122, in connect
+    conn = _connect(dsn, connection_factory=connection_factory, **kwasync)
+psycopg2.OperationalError
+ 
+Encerrado em 31/08/2025 11:38:29,08 (exit code 1) 
+================================================== 

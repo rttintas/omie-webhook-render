@@ -1,0 +1,52 @@
+def gerar_etiquetas_pdf(rows: List[Dict[str, Any]]) -> Path | None:
+    # Gera etiquetas no formato 78x48 mm, 1 por página, com o layout solicitado.
+    ok = ensure_reportlab()
+    if not ok or not rows:
+        return None
+
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+
+    W = 78 * mm
+    H = 48 * mm
+
+    out = PASTA_SAIDA / f"etiquetas_78x48_{dt.datetime.now():%Y%m%d_%H%M%S}.pdf"
+    c = canvas.Canvas(str(out), pagesize=(W, H))
+
+    def desenhar_etiqueta(r: Dict[str, Any]):
+        # Linha 1: COR em caixa alta (ou NF/Pedido se não tiver cor na view)
+        cor = str(r.get("cor") or r.get("descricao_cor") or r.get("numero_pedido") or r.get("nf_numero") or "").upper()
+        c.setFont("Helvetica-Bold", 12)
+        c.drawCentredString(W/2, H - 8*mm, cor[:40])
+
+        # Linha 2: Feita com carinho p/ [cliente]
+        cliente = (r.get("cliente") or "").strip().upper()
+        c.setFont("Helvetica", 10)
+        if cliente:
+            c.drawCentredString(W/2, H - 15*mm, f"FEITA COM CARINHO P/ {cliente[:30]}")
+        else:
+            c.drawCentredString(W/2, H - 15*mm, "FEITA COM CARINHO P/ VOCÊ")
+
+        # Linha 3: Aviso da cor (quebra em duas linhas centralizadas)
+        c.setFont("Helvetica", 8.5)
+        c.drawCentredString(W/2, H - 23*mm, "A COR CHEGA NA TONALIDADE APÓS")
+        c.drawCentredString(W/2, H - 28*mm, "A SECAGEM TOTAL DA TINTA")
+
+        # Linha 4: Rodapé fixo (telefone + Instagram)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawCentredString(W/2, 12*mm, "📞 (11) 91502-1984 • 📸 @RTTINTAS")
+
+        # Linha 5: NF + Marketplace
+        nf = str(r.get("nf_numero") or "")
+        mkt = str(r.get("marketplace") or "—")
+        c.setFont("Helvetica", 9)
+        c.drawString(8*mm, 6*mm, f"NFe:{nf}")
+        c.drawRightString(W - 8*mm, 6*mm, mkt)
+
+    for r in rows:
+        desenhar_etiqueta(r)
+        c.showPage()
+
+    c.save()
+    log(f"[OK] Etiquetas geradas: {out}")
+    return out

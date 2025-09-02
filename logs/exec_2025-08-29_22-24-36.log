@@ -1,0 +1,15 @@
+2025-08-29 22:24:37,031 INFO Lendo PDFs em: G:\Meu Drive\Produção Ecommerce\Entrada Pdfs
+2025-08-29 22:24:37,724 ERROR Falha geral
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 216, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 183, in main
+    rows = query_dicts(sql, (nfs,))
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos necessários para Automação lista rodar\orquestrador.py", line 74, in query_dicts
+    cur.execute(sql, params or {})
+  File "C:\Users\Natalia\AppData\Roaming\Python\Python310\site-packages\psycopg2\extras.py", line 236, in execute
+    return super().execute(query, vars)
+psycopg2.errors.UndefinedTable: relation "public.vw_nf_pedido_std" does not exist
+LINE 3:     FROM public.vw_nf_pedido_std
+                 ^
+

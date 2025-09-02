@@ -1,0 +1,30 @@
+================================================== 
+Iniciando carga Omie -  31/08/2025 14:57:33,48 
+================================================
+Iniciando carga Omie…
+================================================
+
+Baixando PEDIDOS…
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 430, in main
+    cur.execute(SQL_UPSERT_PEDIDO, norm)
+  File "C:\Users\Natalia\AppData\Roaming\Python\Python310\site-packages\psycopg2\extras.py", line 146, in execute
+    return super().execute(query, vars)
+psycopg2.errors.UndefinedTable: relation "public.omie_pedido" does not exist
+LINE 2: INSERT INTO public.omie_pedido
+                    ^
+
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 469, in <module>
+    main()
+  File "G:\Meu Drive\AutomacoesOmie\Arquivos API Omie\load_omie_batch.py", line 462, in main
+    print("\n\u274c  ERRO durante a carga:", repr(e))
+  File "C:\Program Files\Python310\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\u274c' in position 2: character maps to <undefined>
+ 
+Encerrado em 31/08/2025 14:57:39,60 (exit code 1) 
+================================================== 

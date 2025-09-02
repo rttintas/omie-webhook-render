@@ -1,0 +1,5 @@
+Erro em 2025-08-29 17:00:33.620574:
+ERRO:  não existe a coluna v.nf_numero
+LINE 3:     v.nf_numero,
+            ^
+
