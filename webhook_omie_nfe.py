@@ -14,8 +14,15 @@ _pool = None
 async def startup():
     global _pool
     # A URL do banco de dados é lida da variável de ambiente no Render
-    if os.environ.get("DATABASE_URL"):
-        _pool = await asyncpg.create_pool(os.environ.get("DATABASE_URL"))
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        try:
+            _pool = await asyncpg.create_pool(db_url)
+            print("INFO: Conexão com o banco de dados estabelecida com sucesso!")
+        except Exception as e:
+            # ESTA LINHA VAI NOS DAR A RESPOSTA
+            print(f"ERRO CRÍTICO: Falha ao conectar ao banco de dados: {e}")
+            raise e
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -37,7 +44,7 @@ async def omie_webhook(request: Request, token: str):
         # Identifica o evento do webhook
         evento = payload.get('evento')
         
-        # Processa o evento de Nota Fiscal
+        # O código de gravação no banco de dados continua o mesmo
         if evento == "nfe.faturada":
             numero_nf = payload['nfe']['numero']
             raw_data = json.dumps(payload)
@@ -53,7 +60,6 @@ async def omie_webhook(request: Request, token: str):
                     )
             return {"status": "success", "message": f"Nota Fiscal {numero_nf} salva com sucesso."}
 
-        # Processa o evento de Pedido de Venda
         elif evento == "venda.produto.faturado" or evento == "venda.produto.alterada":
             numero_pedido = payload['cabecalho']['numero_pedido']
             raw_data = json.dumps(payload)
@@ -69,7 +75,6 @@ async def omie_webhook(request: Request, token: str):
                     )
             return {"status": "success", "message": f"Pedido de Venda {numero_pedido} salvo com sucesso."}
 
-        # Lida com eventos não suportados
         else:
             return {"status": "ignored", "message": f"Tipo de evento '{evento}' não suportado."}
     except Exception as e:
