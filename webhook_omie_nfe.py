@@ -37,15 +37,14 @@ async def omie_webhook(request: Request, token: str):
         payload = await request.json()
         print(f"Payload recebido: {json.dumps(payload, indent=2)}")
 
-        # Verifica o tipo de evento usando a chave 'topic'
-        evento_topic = payload.get('topic', '').lower()
-
+        # AJUSTE AQUI: Verifica a chave 'topic' e converte para minúsculas
+        evento = payload.get('topic', '').lower()
+        
         # Processa o evento de Nota Fiscal
-        if evento_topic == "nfe.notaautorizada":
-            evento_data = payload.get('evento', {})
-            numero_nf = evento_data.get('numero_nf')
+        if evento == "nfe.notaautorizada":
+            numero_nf = payload['evento']['numero_nf']
             raw_data = json.dumps(payload)
-            if numero_nf and _pool:
+            if _pool:
                 async with _pool.acquire() as conn:
                     await conn.execute(
                         """
@@ -55,36 +54,33 @@ async def omie_webhook(request: Request, token: str):
                         """,
                         numero_nf, raw_data
                     )
-                return {"status": "success", "message": f"Nota Fiscal {numero_nf} salva com sucesso."}
-            else:
-                return {"status": "error", "message": "Dados de nota fiscal incompletos no payload."}
+            return {"status": "success", "message": f"Nota Fiscal {numero_nf} salva com sucesso."}
 
         # Processa o evento de Pedido de Venda
-        elif evento_topic in ("vendaproduto.faturada", "vendaproduto.etapaalterada", "vendaproduto.incluida"):
-            evento_data = payload.get('evento', {})
-            numero_pedido = evento_data.get('numeroPedido')
+        elif evento == "vendaproduto.faturada" or evento == "vendaproduto.etapaalterada" or evento == "vendaproduto.incluida":
+            # O payload do pedido de venda tem o numero dentro do objeto 'evento'
+            numero_pedido = payload['evento']['numeroPedido']
             raw_data = json.dumps(payload)
-            if numero_pedido and _pool:
+            if _pool:
                 async with _pool.acquire() as conn:
                     await conn.execute(
                         """
-                        INSERT INTO public.omie_pedido (numero_pedido, raw)
+                        INSERT INTO public.omie_pedido (numero, raw)
                         VALUES ($1, $2)
-                        ON CONFLICT (numero_pedido) DO UPDATE SET raw = EXCLUDED.raw;
+                        ON CONFLICT (numero) DO UPDATE SET raw = EXCLUDED.raw;
                         """,
                         numero_pedido, raw_data
                     )
-                return {"status": "success", "message": f"Pedido de Venda {numero_pedido} salvo com sucesso."}
-            else:
-                return {"status": "error", "message": "Dados de pedido de venda incompletos no payload."}
-        
+            return {"status": "success", "message": f"Pedido de Venda {numero_pedido} salvo com sucesso."}
+
         # Lida com eventos não suportados
         else:
-            return {"status": "ignored", "message": f"Tipo de evento '{evento_topic}' não suportado."}
+            return {"status": "ignored", "message": f"Tipo de evento '{evento}' não suportado."}
     
     except json.JSONDecodeError:
         print("INFO: Recebida requisição com payload inválido/vazio.")
         return {"status": "error", "message": "Payload não é um JSON válido. Ignorando."}
+
     except Exception as e:
-        print(f"ERRO: Ocorreu um erro inesperado: {e}")
-        return {"status": "error", "message": f"Erro interno do servidor: {e}"}
+        print(f"Erro ao processar o webhook: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno do servidor.")
