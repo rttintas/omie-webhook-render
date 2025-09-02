@@ -20,7 +20,6 @@ async def startup():
             _pool = await asyncpg.create_pool(db_url)
             print("INFO: Conexão com o banco de dados estabelecida com sucesso!")
         except Exception as e:
-            # ESTA LINHA VAI NOS DAR A RESPOSTA
             print(f"ERRO CRÍTICO: Falha ao conectar ao banco de dados: {e}")
             raise e
 
@@ -37,14 +36,14 @@ async def omie_webhook(request: Request, token: str):
         raise HTTPException(status_code=401, detail="Token de autenticação inválido.")
 
     try:
-        # Recebe e desserializa o payload JSON
+        # Tenta receber o payload como JSON
         payload = await request.json()
         print(f"Payload recebido: {json.dumps(payload, indent=2)}")
 
         # Identifica o evento do webhook
         evento = payload.get('evento')
         
-        # O código de gravação no banco de dados continua o mesmo
+        # Processa o evento de Nota Fiscal
         if evento == "nfe.faturada":
             numero_nf = payload['nfe']['numero']
             raw_data = json.dumps(payload)
@@ -60,6 +59,7 @@ async def omie_webhook(request: Request, token: str):
                     )
             return {"status": "success", "message": f"Nota Fiscal {numero_nf} salva com sucesso."}
 
+        # Processa o evento de Pedido de Venda
         elif evento == "venda.produto.faturado" or evento == "venda.produto.alterada":
             numero_pedido = payload['cabecalho']['numero_pedido']
             raw_data = json.dumps(payload)
@@ -75,8 +75,15 @@ async def omie_webhook(request: Request, token: str):
                     )
             return {"status": "success", "message": f"Pedido de Venda {numero_pedido} salvo com sucesso."}
 
+        # Lida com eventos não suportados
         else:
             return {"status": "ignored", "message": f"Tipo de evento '{evento}' não suportado."}
+    
+    # Adiciona esta exceção específica para erros de JSON
+    except json.JSONDecodeError:
+        print("INFO: Recebida requisição com payload inválido/vazio.")
+        return {"status": "error", "message": "Payload não é um JSON válido. Ignorando."}
+
     except Exception as e:
         print(f"Erro ao processar o webhook: {e}")
         raise HTTPException(status_code=500, detail="Erro interno do servidor.")
