@@ -50,7 +50,7 @@ def get_env(name: str, default: Optional[str] = None) -> str:
     return v
 
 def _norm_key(k: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", k) if unicodedata.category(c) != "Mn").lower()
+    return "".join(c for c in unicodedata.normalize("NFD", k) if unicoding.category(c) != "Mn").lower()
 
 def get_field(d: Dict[str, Any], *names: str, default: Any = None) -> Any:
     if not isinstance(d, dict):
@@ -475,9 +475,9 @@ async def omie_webhook(request: Request, token: str):
                     INSERT INTO public.omie_nfe (numero, xml_url, danfe_url, raw, recebido_em)
                     VALUES ($1, $2, $3, $4, now())
                     ON CONFLICT (numero) DO UPDATE
-                    SET xml_url     = COALESCE(EXCLUDED.xml.url, public.omie_nfe.xml_url),
-                        danfe_url   = COALESCE(EXCLUDED.danfe.url, public.omie_nfe.danfe_url),
-                        raw         = COALESCE(EXCLUDED.raw, public.omie_nfe.raw),
+                    SET xml_url     = COALESCE(EXCLUDED.xml_url, public.omie_nfe.xml_url),
+                        danfe_url   = COALESCE(EXCLUDED.danfe_url, public.omie_nfe.danfe_url),
+                        raw         = EXCLUDED.raw,
                         recebido_em = now();
                 """, str(numero_nf) if numero_nf else None, nfe_xml, nfe_danfe, raw_data)
                 alvo = numero_nf
