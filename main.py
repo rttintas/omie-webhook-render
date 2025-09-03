@@ -76,13 +76,13 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
     # Pedidos
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS public.omie_pedido (
-            id_pedido          BIGSERIAL PRIMARY KEY,
-            numero             TEXT UNIQUE,
-            id_pedido_omie     BIGINT,
-            valor_total        NUMERIC(18,2),
-            status             TEXT,
-            raw                JSONB,
-            recebido_em        TIMESTAMPTZ DEFAULT now()
+            id_pedido         BIGSERIAL PRIMARY KEY,
+            numero            TEXT UNIQUE,
+            id_pedido_omie    BIGINT,
+            valor_total       NUMERIC(18,2),
+            status            TEXT,
+            raw               JSONB,
+            recebido_em       TIMESTAMPTZ DEFAULT now()
         );
     """)
     # Colunas idempotentes (se já existirem, não altera)
@@ -97,13 +97,13 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
     # NF-e
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS public.omie_nfe (
-            id                 BIGSERIAL PRIMARY KEY,
-            numero             TEXT UNIQUE,
-            chave_nfe          TEXT,
-            danfe_url          TEXT,
-            xml_url            TEXT,
-            raw                JSONB,
-            recebido_em        TIMESTAMPTZ DEFAULT now()
+            id                BIGSERIAL PRIMARY KEY,
+            numero            TEXT UNIQUE,
+            chave_nfe         TEXT,
+            danfe_url         TEXT,
+            xml_url           TEXT,
+            raw               JSONB,
+            recebido_em       TIMESTAMPTZ DEFAULT now()
         );
     """)
     await conn.execute("ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS chave_nfe TEXT;")
@@ -125,7 +125,8 @@ async def startup() -> None:
     global _pool, _http
     db_url = get_env("DATABASE_URL")
     _pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
-    _http = httpx.AsyncClient(base_url=OMIE_BASE, timeout=30.0)
+    # Aumentando o timeout para 60 segundos, conforme sugerido pela Omie
+    _http = httpx.AsyncClient(base_url=OMIE_BASE, timeout=60.0)
     async with _pool.acquire() as conn:
         await conn.execute("SELECT 1;")
         await ensure_schema(conn)
@@ -219,9 +220,9 @@ def _evento(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _extrai_pedido_e_nf(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[float], Dict[str, Any]]:
     ev = _evento(payload)
     numero_pedido = get_field(ev, "numeroPedido", "numero_pedido", "númeroPedido", "pedido")
-    numero_nf     = get_field(ev, "numero_nf", "numeroNFe", "numero", "número")
-    id_pedido     = get_field(ev, "idPedido", "id_pedido")
-    valor_pedido  = get_field(ev, "valorPedido", "valor_pedido", "valor")
+    numero_nf       = get_field(ev, "numero_nf", "numeroNFe", "numero", "número")
+    id_pedido       = get_field(ev, "idPedido", "id_pedido")
+    valor_pedido = get_field(ev, "valorPedido", "valor_pedido", "valor")
     try:
         id_pedido = int(id_pedido) if id_pedido is not None else None
     except Exception:
@@ -231,7 +232,7 @@ def _extrai_pedido_e_nf(payload: Dict[str, Any]) -> Tuple[Optional[str], Optiona
     except Exception:
         valor_pedido = None
     numero_pedido = str(numero_pedido) if numero_pedido is not None else None
-    numero_nf     = str(numero_nf) if numero_nf is not None else None
+    numero_nf       = str(numero_nf) if numero_nf is not None else None
     return numero_pedido, numero_nf, id_pedido, valor_pedido, ev
 
 
@@ -322,10 +323,10 @@ async def omie_webhook(request: Request, token: str):
                 VALUES ($1, $2, $3, $4, $5, now())
                 ON CONFLICT (numero) DO UPDATE
                 SET id_pedido_omie = COALESCE(EXCLUDED.id_pedido_omie, public.omie_pedido.id_pedido_omie),
-                    valor_total    = COALESCE(EXCLUDED.valor_total,    public.omie_pedido.valor_total),
-                    status         = COALESCE(EXCLUDED.status,         public.omie_pedido.status),
-                    raw            = EXCLUDED.raw,
-                    recebido_em    = now();
+                    valor_total  = COALESCE(EXCLUDED.valor_total,    public.omie_pedido.valor_total),
+                    status       = COALESCE(EXCLUDED.status,         public.omie_pedido.status),
+                    raw          = EXCLUDED.raw,
+                    recebido_em  = now();
             """, numero_pedido, id_pedido, valor_pedido, status, raw_data)
 
         return {"status": "success", "message": f"Pedido {numero_pedido or id_pedido} salvo/atualizado.", "retry_status": detailed is None}
