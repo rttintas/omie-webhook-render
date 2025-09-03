@@ -75,8 +75,8 @@ def _utcnow() -> datetime:
 
 # backoff progressivo com jitter
 def _next_delay_seconds(attempts: int) -> float:
-    # 1s, 2s, 4s, 8s, 15s (cap) + jitter 0–0.3
-    base = min(1 * (2 ** max(0, attempts - 1)), 15)
+    # 1s, 5s, 15s, 60s, 2m (cap) + jitter 0–0.3
+    base = min(1 * (2 ** max(0, attempts - 1)), 120)
     return base + random.random() * 0.3
 
 
