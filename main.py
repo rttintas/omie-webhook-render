@@ -50,7 +50,7 @@ def get_env(name: str, default: Optional[str] = None) -> str:
     return v
 
 def _norm_key(k: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", k) if unicoding.category(c) != "Mn").lower()
+    return "".join(c for c in unicodedata.normalize("NFD", k) if unicodedata.category(c) != "Mn").lower()
 
 def get_field(d: Dict[str, Any], *names: str, default: Any = None) -> Any:
     if not isinstance(d, dict):
