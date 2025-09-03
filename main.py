@@ -1,11 +1,10 @@
 # main.py
 # FastAPI + asyncpg — Webhook Omie (Render)
-# - Retry/backoff para 504/timeout ao consultar pedido
-# - Fallback: salva pedido com dados do webhook se Omie API falhar
-# - Aceita payloads com "event" ou "evento", JSON ou form-urlencoded
-# - Normaliza chaves com acento (ex.: númeroPedido → numeroPedido)
-# - Salva NF-e por chave ou número; limpa espaços nas URLs
-# - Health endpoints: /health/app e /health/db
+# - Opera em modo degradado com fila para enriquecimento.
+# - Fila simples em omie_jobs para reprocessamento.
+# - Endpoint /jobs/run para processar a fila.
+# - Retry/backoff e fallback em caso de falha.
+# - Dedupe por id_pedido.
 
 from __future__ import annotations
 
@@ -31,6 +30,7 @@ except Exception:
 APP_NAME = "Omie Webhook API"
 OMIE_BASE = "https://api.omie.com.br"
 OMIE_PEDIDO_PATH = "/api/v1/produtos/pedido/"
+ENRICH_IMMEDIATE_FLAG = os.environ.get("ENRICH_PEDIDO_IMEDIATO", "true").lower() == "true"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("omie")
@@ -48,11 +48,9 @@ def get_env(name: str, default: Optional[str] = None) -> str:
     return v
 
 def _norm_key(k: str) -> str:
-    # remove acento e baixa caixa (para comparar nomes de campos)
     return "".join(c for c in unicodedata.normalize("NFD", k) if unicodedata.category(c) != "Mn").lower()
 
 def get_field(d: Dict[str, Any], *names: str, default: Any = None) -> Any:
-    """Busca um campo aceitando variações com/sem acento e snake/camel."""
     if not isinstance(d, dict):
         return default
     keys_map = { _norm_key(k): k for k in d.keys() }
@@ -85,7 +83,6 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
             recebido_em       TIMESTAMPTZ DEFAULT now()
         );
     """)
-    # Colunas idempotentes (se já existirem, não altera)
     await conn.execute("ALTER TABLE public.omie_pedido ADD COLUMN IF NOT EXISTS id_pedido_omie BIGINT;")
     await conn.execute("ALTER TABLE public.omie_pedido ADD COLUMN IF NOT EXISTS valor_total NUMERIC(18,2);")
     await conn.execute("ALTER TABLE public.omie_pedido ADD COLUMN IF NOT EXISTS status TEXT;")
@@ -112,10 +109,21 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
     await conn.execute("ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS raw JSONB;")
     await conn.execute("ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS recebido_em TIMESTAMPTZ DEFAULT now();")
     await conn.execute("ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS numero TEXT;")
-    # Único parcial para permitir vários NULLs
     await conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_omie_nfe_chave
         ON public.omie_nfe (chave_nfe) WHERE chave_nfe IS NOT NULL;
+    """)
+    
+    # Nova tabela para a fila de enriquecimento
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS public.omie_jobs (
+            id_job        BIGSERIAL PRIMARY KEY,
+            id_pedido     BIGINT NOT NULL,
+            status        TEXT NOT NULL,
+            tentativas    INTEGER DEFAULT 0,
+            criado_em     TIMESTAMPTZ DEFAULT now(),
+            processado_em TIMESTAMPTZ
+        );
     """)
 
 
@@ -125,7 +133,6 @@ async def startup() -> None:
     global _pool, _http
     db_url = get_env("DATABASE_URL")
     _pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
-    # Aumentando o timeout para 60 segundos, conforme sugerido pela Omie
     _http = httpx.AsyncClient(base_url=OMIE_BASE, timeout=60.0)
     async with _pool.acquire() as conn:
         await conn.execute("SELECT 1;")
@@ -169,17 +176,14 @@ async def _parse_payload(request: Request) -> Optional[dict]:
                 return j
         elif "application/x-www-form-urlencoded" in ct:
             body = (await request.body()).decode("utf-8", "ignore")
-            # busca por um campo único com o JSON, ou chave a chave
             from urllib.parse import parse_qs
             form = parse_qs(body)
-            # tenta campos comuns que carregam o JSON inteiro
             for k in ("payload", "json", "body", "data"):
                 if k in form:
                     try:
                         return json.loads(form[k][0])
                     except Exception:
                         pass
-            # monta candidato a partir de chaves soltas
             cand: Dict[str, Any] = {}
             for k in ("messageId", "topic", "evento", "event"):
                 if k in form:
@@ -193,12 +197,10 @@ async def _parse_payload(request: Request) -> Optional[dict]:
                         cand[k] = v
             if cand:
                 return cand
-        # corpo cru (JSON)
         raw = (await request.body() or b"").decode("utf-8", "ignore").strip()
         if raw:
             return json.loads(raw)
     except Exception:
-        # loga prévia do corpo para diagnosticar formatos estranhos
         rawp = (await request.body() or b"")[:1024]
         logger.warning("Webhook sem JSON parseável. headers=%s raw-preview=%r",
                        dict(request.headers), rawp)
@@ -247,7 +249,6 @@ async def consultar_pedido_omie(id_pedido: int) -> Optional[Dict[str, Any]]:
         "app_key": app_key,
         "app_secret": app_secret,
         "param": [{
-            # Mandamos os dois para cobrir variações
             "idPedido": id_pedido,
             "codigo_pedido": id_pedido
         }]
@@ -256,7 +257,7 @@ async def consultar_pedido_omie(id_pedido: int) -> Optional[Dict[str, Any]]:
     if not _http:
         raise RuntimeError("Cliente HTTP indisponível")
 
-    waits = [0, 1, 3, 7, 15]  # total ~26s
+    waits = [0, 1, 3, 7, 15]
     for i, wait in enumerate(waits):
         if wait:
             await asyncio.sleep(wait)
@@ -268,10 +269,8 @@ async def consultar_pedido_omie(id_pedido: int) -> Optional[Dict[str, Any]]:
                     return r.json()
                 except Exception:
                     return None
-            # 5xx → tenta de novo
             if 500 <= r.status_code < 600:
                 continue
-            # 4xx (exceto 429) não resolve com retry
             return None
         except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectError):
             continue
@@ -304,9 +303,8 @@ async def omie_webhook(request: Request, token: str):
     # ----- Pedido de Venda -----
     if topic.startswith("vendaproduto."):
         async with _pool.acquire() as conn:
-            # tenta consultar detalhes na Omie (retry/backoff)
             detailed = None
-            if id_pedido:
+            if id_pedido and ENRICH_IMMEDIATE_FLAG:
                 logger.info("Chamando Omie API para consultar o pedido: %s", id_pedido)
                 detailed = await consultar_pedido_omie(id_pedido)
                 if detailed:
@@ -314,10 +312,17 @@ async def omie_webhook(request: Request, token: str):
                     status = None
                 else:
                     status = "pendente_consulta"
+            elif id_pedido:
+                # Se ENRICH_IMMEDIATE_FLAG for false, enfileira o job
+                status = "pendente_consulta"
+                await conn.execute("""
+                    INSERT INTO public.omie_jobs (id_pedido, status, criado_em)
+                    VALUES ($1, 'pendente', now());
+                """, id_pedido)
+
             else:
                 status = "pendente_consulta"
 
-            # fallback: não perder evento se a Omie falhou
             await conn.execute("""
                 INSERT INTO public.omie_pedido (numero, id_pedido_omie, valor_total, status, raw, recebido_em)
                 VALUES ($1, $2, $3, $4, $5, now())
@@ -368,3 +373,53 @@ async def omie_webhook(request: Request, token: str):
     # ----- Não suportado -----
     else:
         return {"status": "ignored", "message": f"Tipo de evento '{topic}' não suportado."}
+
+
+# ------------------------- job runner ------------------------- #
+@app.get("/jobs/run")
+async def run_jobs():
+    """Endpoint para processar os jobs pendentes na fila."""
+    if not _pool:
+        raise HTTPException(500, "Pool indisponível")
+    
+    async with _pool.acquire() as conn:
+        jobs = await conn.fetch("""
+            SELECT id_job, id_pedido
+            FROM public.omie_jobs
+            WHERE status = 'pendente'
+            ORDER BY criado_em
+            LIMIT 10;
+        """)
+
+        if not jobs:
+            return {"status": "no_jobs", "message": "Nenhum job pendente para processar."}
+
+        processed_count = 0
+        for job in jobs:
+            id_pedido = job["id_pedido"]
+            
+            await conn.execute("""
+                UPDATE public.omie_jobs SET status = 'processando', tentativas = tentativas + 1
+                WHERE id_job = $1;
+            """, job["id_job"])
+
+            detailed = await consultar_pedido_omie(id_pedido)
+
+            if detailed:
+                status = "processado"
+                raw_data = json.dumps(detailed, ensure_ascii=False)
+                await conn.execute("""
+                    UPDATE public.omie_pedido SET raw = $1, status = 'completo'
+                    WHERE id_pedido_omie = $2;
+                """, raw_data, id_pedido)
+            else:
+                status = "falhou"
+                
+            await conn.execute("""
+                UPDATE public.omie_jobs SET status = $1, processado_em = now()
+                WHERE id_job = $2;
+            """, status, job["id_job"])
+            
+            processed_count += 1
+
+    return {"status": "success", "message": f"{processed_count} jobs processados."}
