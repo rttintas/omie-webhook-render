@@ -415,7 +415,7 @@ async def omie_webhook(request: Request, token: str):
             # Tenta consultar imediatamente se o flag estiver ligado, ou enfileira
             if id_pedido and ENRICH_IMMEDIATE_FLAG:
                 logger.info("Chamando Omie API para consultar o pedido: %s", id_pedido)
-                detailed = await consultar_pedido_omie(id_pedido)
+                detailed = await consultar_pedido_omie(int(id_pedido))
                 if detailed:
                     raw_data = json.dumps(detailed, ensure_ascii=False)
                 else:
