@@ -148,7 +148,7 @@ async def enqueue_job(job_type: str, payload: Dict[str, Any], delay_seconds: int
         await conn.execute("""
             INSERT INTO public.omie_jobs (job_type, status, attempts, next_run, payload, created_at, updated_at)
             VALUES ($1, 'pending', 0, now() + ($2 || ' seconds')::interval, $3::jsonb, now(), now())
-        """, job_type, delay_seconds, json.dumps(payload, ensure_ascii=False))
+        """, job_type, str(delay_seconds), json.dumps(payload, ensure_ascii=False)) # <-- AQUI, a correção
 
 async def pick_pending_jobs(limit: int = 20) -> List[asyncpg.Record]:
     async with pool.acquire() as conn:
