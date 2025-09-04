@@ -69,26 +69,26 @@ async def db_init_schema():
         # nfe (mantém compatível com o que você já tem)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS public.omie_nfe (
-            chave_nfe     TEXT,
-            numero        TEXT,
-            serie         TEXT,
-            emitida_em    TIMESTAMPTZ,
+            chave_nfe      TEXT,
+            numero         TEXT,
+            serie          TEXT,
+            emitida_em     TIMESTAMPTZ,
             cnpj_emitente TEXT,
             cnpj_destinatario TEXT,
-            valor_total   NUMERIC,
-            status        TEXT,
-            xml           TEXT,
-            pdf_url       TEXT,
+            valor_total    NUMERIC,
+            status         TEXT,
+            xml            TEXT,
+            pdf_url        TEXT,
             last_event_at TIMESTAMPTZ,
-            updated_at    TIMESTAMPTZ,
-            data_emissao  TEXT,
-            cliente_nome  TEXT,
-            raw           JSONB,
-            created_at    TIMESTAMPTZ DEFAULT now(),
-            recebido_em   TIMESTAMPTZ DEFAULT now(),
-            id_nfe        BIGINT,
-            danfe_url     TEXT,
-            xml_url       TEXT
+            updated_at     TIMESTAMPTZ,
+            data_emissao   TEXT,
+            cliente_nome   TEXT,
+            raw            JSONB,
+            created_at     TIMESTAMPTZ DEFAULT now(),
+            recebido_em    TIMESTAMPTZ DEFAULT now(),
+            id_nfe         BIGINT,
+            danfe_url      TEXT,
+            xml_url        TEXT
         );
         """)
 
@@ -196,7 +196,7 @@ async def omie_consultar_pedido(id_pedido: Optional[int], numero_pedido: Optiona
         raise RuntimeError("OMIE_APP_KEY/OMIE_APP_SECRET não configurados.")
 
     param: Dict[str, Any] = {}
-    if id_pedido:              # <== chave correta para a API do Omie
+    if id_pedido:             # <== chave correta para a API do Omie
         param["codigo_pedido"] = int(id_pedido)
     elif numero_pedido:
         param["numero_pedido"] = str(numero_pedido)
@@ -212,6 +212,11 @@ async def omie_consultar_pedido(id_pedido: Optional[int], numero_pedido: Optiona
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(OMIE_PEDIDO_ENDPOINT, json=body)
+        
+        # Loga o corpo da resposta em caso de erro para ajudar na depuração
+        if r.status_code >= 400:
+            jlog("error", tag="omie_api_error_body", status_code=r.status_code, response_body=r.text)
+
         # Se 4xx/5xx, lança exception com texto (mostra no painel Render)
         r.raise_for_status()
         data = r.json()
@@ -301,13 +306,13 @@ async def omie_webhook(request: Request, token: Optional[str] = Query(default=No
             await enqueue_job("pedido.consultar", job_payload)
 
         jlog("info", tag="omie_webhook_received",
-             numero_pedido=numero_pedido, id_pedido=id_pedido_omie)
+              numero_pedido=numero_pedido, id_pedido=id_pedido_omie)
         return {"ok": True, "numero_pedido": numero_pedido, "id_pedido": id_pedido_omie}
 
     # Evento de NFe simples (salva links)
     if topic.lower() in {"nfe.notaautorizada", "nfe.nota_autorizada"}:
         nfe_chave = str(event.get("nfe_chave") or event.get("chNFe") or "" or None)
-        nfe_xml   = str(event.get("nfe_xml") or event.get("xml") or "" or None)
+        nfe_xml    = str(event.get("nfe_xml") or event.get("xml") or "" or None)
         nfe_danfe = str(event.get("nfe_danfe") or event.get("danfe") or event.get("pdf_url") or "" or None)
         numero_nf = str(event.get("numero_nf") or event.get("numero") or "" or None)
 
