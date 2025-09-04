@@ -369,3 +369,162 @@ async def _run_single_job(conn: asyncpg.Connection, job: asyncpg.Record) -> None
                        SET attempts=$2, next_run=$3, last_error='consulta sem sucesso', updated_at=now()
                      WHERE id=$1;
                 """, job_id, attempts, next_run)
+        else:
+            await conn.execute("""
+                UPDATE public.omie_jobs
+                   SET status='done', attempts=$2, last_error='tipo desconhecido', updated_at=now()
+                 WHERE id=$1;
+            """, job_id, attempts)
+
+    except Exception as e:
+        next_run = _schedule_next_run(attempts)
+        await conn.execute("""
+            UPDATE public.omie_jobs
+               SET attempts=$2, next_run=$3, last_error=$4, updated_at=now()
+             WHERE id=$1;
+        """, job_id, attempts, next_run, str(e)[:800])
+
+
+# ------------------------- webhook ------------------------- #
+@app.post("/omie/webhook")
+async def omie_webhook(request: Request, token: str):
+    expected = get_env("WEBHOOK_TOKEN")
+    if token != expected:
+        raise HTTPException(status_code=401, detail="Token inválido.")
+
+    payload = await _parse_payload(request)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Payload inválido ou vazio.")
+
+    logger.info("Payload recebido: %s", json.dumps(payload, ensure_ascii=False))
+
+    topic = _topic(payload.get("topic", ""))
+
+    numero_pedido, numero_nf, id_pedido, valor_pedido, evento = _extrai_pedido_e_nf(payload)
+    raw_data = json.dumps(payload, ensure_ascii=False)
+
+    if not _pool:
+        raise HTTPException(500, "Pool indisponível")
+
+    # ----- Pedido de Venda -----
+    if topic.startswith("vendaproduto."):
+        async with _pool.acquire() as conn:
+            detailed = None
+            status: Optional[str] = None
+            
+            # Tenta consultar imediatamente se o flag estiver ligado, ou enfileira
+            if id_pedido and ENRICH_IMMEDIATE_FLAG:
+                logger.info("Chamando Omie API para consultar o pedido: %s", id_pedido)
+                detailed = await consultar_pedido_omie(int(id_pedido))
+                if detailed:
+                    raw_data = json.dumps(detailed, ensure_ascii=False)
+                else:
+                    status = "pendente_consulta"
+                    await _enqueue_job(conn, "pedido.consultar",
+                                       {"id_pedido": id_pedido, "numero_pedido": numero_pedido},
+                                       err="consulta inicial falhou")
+            elif id_pedido:
+                # Se ENRICH_IMEDIATE_FLAG for false, enfileira o job
+                status = "pendente_consulta"
+                await _enqueue_job(conn, "pedido.consultar",
+                                    {"id_pedido": id_pedido, "numero_pedido": numero_pedido})
+            else:
+                # Se id_pedido ausente, enfileira o job
+                status = "pendente_consulta"
+                await _enqueue_job(conn, "pedido.consultar",
+                                    {"id_pedido": id_pedido, "numero_pedido": numero_pedido})
+                
+            # fallback: não perder evento
+            await conn.execute("""
+                INSERT INTO public.omie_pedido (numero, id_pedido_omie, valor_total, status, raw, recebido_em)
+                VALUES ($1, $2, $3, $4, $5, now())
+                ON CONFLICT (numero) DO UPDATE
+                SET id_pedido_omie = COALESCE(EXCLUDED.id_pedido_omie, public.omie_pedido.id_pedido_omie),
+                    valor_total  = COALESCE(EXCLUDED.valor_total,    public.omie_pedido.valor_total),
+                    status       = COALESCE(EXCLUDED.status,         public.omie_pedido.status),
+                    raw          = EXCLUDED.raw,
+                    recebido_em  = now();
+            """, numero_pedido, id_pedido, valor_pedido, status, raw_data)
+
+        return {"status": "success",
+                "message": f"Pedido {numero_pedido or id_pedido} salvo/atualizado.",
+                "consulta_imediata_ok": bool(detailed)}
+
+    # ----- NF-e -----
+    elif topic in {"nfe.notaautorizada", "nfe.nota_autorizada", "nfe.autorizada"}:
+        nfe_chave = get_field(evento, "nfe_chave", "chave_nfe", "chave", "chNFe")
+        nfe_xml   = _clean_url(get_field(evento, "nfe_xml", "xml_url", "xml"))
+        nfe_danfe = _clean_url(get_field(evento, "nfe_danfe", "danfe_url", "pdf_url"))
+        numero_nf = numero_nf or get_field(evento, "numero_nf", "numeroNFe", "numero")
+
+        async with _pool.acquire() as conn:
+            if nfe_chave:
+                await conn.execute("""
+                    INSERT INTO public.omie_nfe (chave_nfe, numero, xml_url, danfe_url, raw, recebido_em)
+                    VALUES ($1, $2, $3, $4, $5, now())
+                    ON CONFLICT (chave_nfe) DO UPDATE
+                    SET numero      = COALESCE(EXCLUDED.numero, public.omie_nfe.numero),
+                        xml_url     = COALESCE(EXCLUDED.xml_url, public.omie_nfe.xml_url),
+                        danfe_url   = COALESCE(EXCLUDED.danfe_url, public.omie_nfe.danfe_url),
+                        raw         = EXCLUDED.raw,
+                        recebido_em = now();
+                """, str(nfe_chave), str(numero_nf) if numero_nf else None, nfe_xml, nfe_danfe, raw_data)
+                alvo = nfe_chave
+            else:
+                await conn.execute("""
+                    INSERT INTO public.omie_nfe (numero, xml_url, danfe_url, raw, recebido_em)
+                    VALUES ($1, $2, $3, $4, now())
+                    ON CONFLICT (numero) DO UPDATE
+                    SET xml_url     = COALESCE(EXCLUDED.xml_url, public.omie_nfe.xml_url),
+                        danfe_url   = COALESCE(EXCLUDED.danfe_url, public.omie_nfe.danfe_url),
+                        raw         = EXCLUDED.raw,
+                        recebido_em = now();
+                """, str(numero_nf) if numero_nf else None, nfe_xml, nfe_danfe, raw_data)
+                alvo = numero_nf
+
+        return {"status": "success", "message": f"NF {alvo} salva/atualizada."}
+
+    # ----- Não suportado -----
+    else:
+        return {"status": "ignored", "message": f"Tipo de evento '{topic}' não suportado."}
+
+
+# ------------------------- admin: rodar jobs ------------------------- #
+@app.post("/admin/run-jobs")
+async def run_jobs(secret: str = Query(...), limit: int = Query(20, ge=1, le=200)):
+    if secret != get_env("ADMIN_SECRET"):
+        raise HTTPException(401, "forbidden")
+    
+    if not _pool:
+        raise HTTPException(500, "Pool indisponível")
+    
+    processed = 0
+    async with _pool.acquire() as conn:
+        rows: List[asyncpg.Record] = await conn.fetch("""
+            SELECT * FROM public.omie_jobs
+             WHERE status='pending' AND next_run <= now()
+             ORDER BY next_run ASC
+             LIMIT $1;
+        """, limit)
+        for job in rows:
+            await _run_single_job(conn, job)
+            processed += 1
+
+    return {"processed": processed, "limit": limit, "time": _utcnow().isoformat()}
+
+@app.get("/admin/jobs-stats")
+async def jobs_stats(secret: str = Query(...)):
+    if secret != get_env("ADMIN_SECRET"):
+        raise HTTPException(401, "forbidden")
+
+    if not _pool:
+        raise HTTPException(500, "Pool indisponível")
+
+    async with _pool.acquire() as conn:
+        stats = await conn.fetch("""
+            SELECT status, count(*) AS total
+              FROM public.omie_jobs
+             GROUP BY status
+             ORDER BY status;
+        """)
+        return {"stats": [dict(r) for r in stats], "time": _utcnow().isoformat()}
