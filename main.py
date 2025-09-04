@@ -9,29 +9,29 @@ import asyncpg
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Query
 
-# -----------------------------
-# Config
-# -----------------------------
+# ------------------------------------------------------------
+# Configuração
+# ------------------------------------------------------------
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "troque-isto")
 OMIE_APP_KEY = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET", "")
-OMIE_WEBHOOK_TOKEN = os.getenv("OMIE_WEBHOOK_TOKEN", "")  # opcional, valida ?token=
+OMIE_WEBHOOK_TOKEN = os.getenv("OMIE_WEBHOOK_TOKEN", "")  # valida ?token=...
 OMIE_TIMEOUT = int(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))
 OMIE_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 
 _pool: Optional[asyncpg.Pool] = None
 
 
-# -----------------------------
-# Pool de conexões
-# -----------------------------
+# ------------------------------------------------------------
+# Conexão com o banco
+# ------------------------------------------------------------
 async def get_pool() -> asyncpg.Pool:
     global _pool
-    if _pool is None:
+    if not _pool:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL não configurada")
         _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -39,9 +39,31 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
+async def _safe_bootstrap(conn: asyncpg.Connection):
+    """Migrações seguras (idempotentes). NÃO cria UNIQUE aqui."""
+    await conn.execute(
+        """
+        ALTER TABLE omie_pedido
+          ADD COLUMN IF NOT EXISTS raw_basico  JSONB,
+          ADD COLUMN IF NOT EXISTS raw_detalhe JSONB,
+          ADD COLUMN IF NOT EXISTS status      TEXT,
+          ADD COLUMN IF NOT EXISTS recebido_em TIMESTAMPTZ DEFAULT now(),
+          ADD COLUMN IF NOT EXISTS codigo_pedido_integracao TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_omie_pedido_status
+          ON omie_pedido (status);
+
+        CREATE INDEX IF NOT EXISTS idx_omie_pedido_integr
+          ON omie_pedido (codigo_pedido_integracao);
+        """
+    )
+
+
 @app.on_event("startup")
 async def _startup():
-    await get_pool()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _safe_bootstrap(conn)
 
 
 @app.on_event("shutdown")
@@ -52,16 +74,16 @@ async def _shutdown():
         _pool = None
 
 
-# -----------------------------
-# Utils para extrair campos do JSON
-# -----------------------------
+# ------------------------------------------------------------
+# Utilitários
+# ------------------------------------------------------------
 WANTED_ID_KEYS = {
     "idPedido",
     "id_pedido",
     "idPedidoOmie",
     "idPedidoVenda",
     "id_pedido_omie",
-    "codigo_pedido",  # alguns webhooks já mandam com esse nome
+    "codigo_pedido",  # às vezes vem assim
 }
 WANTED_NUM_KEYS = {"numeroPedido", "numero_pedido", "numero", "codigo_pedido_integracao"}
 WANTED_INTEGR_KEYS = {"codigo_pedido_integracao", "codigoPedidoIntegracao"}
@@ -99,29 +121,39 @@ def deep_find_first(obj: Any, keys: set[str]) -> Optional[Any]:
 
 
 def looks_like_integr(code: Optional[str]) -> bool:
-    """Heurística simples: integração costuma ser alfanumérico (ex.: OH15186144)."""
+    """Heurística simples para códigos de integração (ex.: OH15186144)."""
     return bool(code) and not str(code).isdigit()
 
 
-# -----------------------------
-# Chamadas à Omie
-# -----------------------------
-async def omie_consultar_pedido(
+# ------------------------------------------------------------
+# Chamada Omie (blindada — nunca manda idPedido)
+# ------------------------------------------------------------
+def _param_consultar(
     codigo_pedido: int | None = None,
     codigo_pedido_integracao: str | None = None,
+    idPedido_legacy: int | None = None,  # compat: converte para codigo_pedido
 ) -> dict:
-    """
-    Consulta detalhes do pedido de venda (PedidoVendaProduto::ConsultarPedido).
-    Aceita id numérico (codigo_pedido) ou código de integração (codigo_pedido_integracao).
-    """
-    if not codigo_pedido and not codigo_pedido_integracao:
-        raise ValueError("Informe codigo_pedido ou codigo_pedido_integracao")
+    if codigo_pedido is None and codigo_pedido_integracao is None and idPedido_legacy is None:
+        raise ValueError("Informe codigo_pedido OU codigo_pedido_integracao.")
 
     param: dict[str, object] = {}
     if codigo_pedido is not None:
         param["codigo_pedido"] = int(codigo_pedido)
     if codigo_pedido_integracao:
         param["codigo_pedido_integracao"] = str(codigo_pedido_integracao)
+    if idPedido_legacy is not None and "codigo_pedido" not in param:
+        param["codigo_pedido"] = int(idPedido_legacy)
+
+    # Garantia extra: nunca retorna idPedido*
+    return param
+
+
+async def omie_consultar_pedido(
+    codigo_pedido: int | None = None,
+    codigo_pedido_integracao: str | None = None,
+    _idPedido_legacy: int | None = None,
+) -> dict:
+    param = _param_consultar(codigo_pedido, codigo_pedido_integracao, _idPedido_legacy)
 
     payload = {
         "call": "ConsultarPedido",
@@ -130,25 +162,26 @@ async def omie_consultar_pedido(
         "param": [param],
     }
 
+    # auditoria: garante que não há 'idPedido' no payload
+    assert "idPedido" not in json.dumps(payload), "Não envie idPedido para ConsultarPedido"
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(OMIE_TIMEOUT)) as client:
+        logger.info({"tag": "omie_http_out", "payload": payload})
         r = await client.post(OMIE_URL, json=payload)
-        # Log minimamente verboso (status e parâmetro)
-        logger.info({"tag": "omie_http", "status": r.status_code, "param": param})
         try:
             data = r.json()
         except Exception:
             data = {"_non_json_body": r.text}
-        # Loga a resposta inteira (útil para auditoria)
-        logger.info({"tag": "omie_response", "param": param, "response": data})
+        logger.info(
+            {"tag": "omie_http_in", "status": r.status_code, "param": param, "fault": (data.get("faultstring") if isinstance(data, dict) else None)}
+        )
         r.raise_for_status()
-        # Mesmo com 200 a Omie pode retornar "Erros encontrados" dentro do JSON;
-        # deixe para o fluxo superior decidir como tratar.
         return data
 
 
-# -----------------------------
-# Helpers de Banco
-# -----------------------------
+# ------------------------------------------------------------
+# Banco: helpers
+# ------------------------------------------------------------
 async def has_unique_on_id(conn: asyncpg.Connection) -> bool:
     row = await conn.fetchrow(
         """
@@ -171,10 +204,10 @@ async def insert_inbox_safe(
     codigo_pedido_integracao: Optional[str] = None,
 ):
     """
-    Insere o evento recebido sem derrubar a app.
-    - Se houver UNIQUE pelo id e tivermos 'id_pedido': UPSERT.
-    - Se só houver 'codigo_pedido_integracao': INSERT simples (sem upsert).
-    - Se não houver chave nenhuma: marca 'sem_id'.
+    Insere o evento recebido:
+      - com id -> UPSERT se UNIQUE existir; caso contrário, INSERT
+      - com apenas integração -> INSERT
+      - sem chave -> status 'sem_id'
     """
     if id_pedido is None and not codigo_pedido_integracao:
         await conn.execute(
@@ -189,7 +222,6 @@ async def insert_inbox_safe(
         return
 
     if id_pedido is not None and await has_unique_on_id(conn):
-        # UPSERT por constraint do id
         await conn.execute(
             """
             INSERT INTO omie_pedido (numero, id_pedido_omie, codigo_pedido_integracao, raw_basico, status)
@@ -206,7 +238,6 @@ async def insert_inbox_safe(
             json.dumps(body),
         )
     else:
-        # Sem UNIQUE ou só integração → insert simples
         await conn.execute(
             """
             INSERT INTO omie_pedido (numero, id_pedido_omie, codigo_pedido_integracao, raw_basico, status)
@@ -285,9 +316,9 @@ async def fetch_keys_by_numero(conn: asyncpg.Connection, numero: str):
     )
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Endpoints básicos
-# -----------------------------
+# ------------------------------------------------------------
 @app.get("/")
 async def root():
     return {"status": "ok"}
@@ -298,9 +329,9 @@ async def healthz():
     return {"status": "healthy"}
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Webhook da Omie
-# -----------------------------
+# ------------------------------------------------------------
 @app.post("/omie/webhook")
 async def omie_webhook(request: Request, token: str = Query(default="")):
     if OMIE_WEBHOOK_TOKEN and token != OMIE_WEBHOOK_TOKEN:
@@ -316,7 +347,6 @@ async def omie_webhook(request: Request, token: str = Query(default="")):
     id_pedido = _as_int(id_any)
     codigo_pedido_integracao = None
 
-    # Preferir campo explícito de integração; se não houver, inferir a partir de "numero" alfanumérico
     if isinstance(integ_any, str) and integ_any:
         codigo_pedido_integracao = integ_any
     elif looks_like_integr(numero):
@@ -334,6 +364,7 @@ async def omie_webhook(request: Request, token: str = Query(default="")):
     pool = await get_pool()
     async with pool.acquire() as conn:
         try:
+            await _safe_bootstrap(conn)  # idempotente
             await insert_inbox_safe(conn, numero, id_pedido, body, codigo_pedido_integracao)
         except Exception:
             logger.error(
@@ -345,17 +376,18 @@ async def omie_webhook(request: Request, token: str = Query(default="")):
                     "codigo_pedido_integracao": codigo_pedido_integracao,
                 }
             )
-            # não derruba a Omie; 202 = aceito p/ processamento
+            # Não derruba a Omie: aceite para processamento posterior
             raise HTTPException(status_code=202, detail="aceito para processamento")
 
     return {"ok": True}
 
 
-# -----------------------------
-# Reprocesso (pendentes e por pedido)
-# -----------------------------
+# ------------------------------------------------------------
+# Reprocesso
+# ------------------------------------------------------------
 async def _processar_pendentes(conn: asyncpg.Connection, limit: int):
-    total_ok, total_err, ids_ok = 0, 0, []
+    ok = err = 0
+    ids_ok = []
     rows = await fetch_pendentes(conn, limit=limit)
 
     for row in rows:
@@ -364,7 +396,8 @@ async def _processar_pendentes(conn: asyncpg.Connection, limit: int):
         numero = row["numero"]
 
         try:
-            logger.info({"tag": "reprocess_start", "id": idp, "integ": integ, "numero": numero})
+            logger.info({"tag": "reprocess_start", "id_pedido": idp, "integ": integ, "numero": numero})
+
             if idp is not None:
                 detalhe = await omie_consultar_pedido(codigo_pedido=int(idp))
                 await update_pedido_detalhe(conn, detalhe, id_pedido_omie=int(idp))
@@ -376,15 +409,15 @@ async def _processar_pendentes(conn: asyncpg.Connection, limit: int):
                 continue
 
             logger.info({"tag": "reprocess_done", "id": idp, "integ": integ, "numero": numero})
-            total_ok += 1
+            ok += 1
             ids_ok.append(idp if idp is not None else integ)
         except Exception:
-            total_err += 1
+            err += 1
             logger.error(
-                {"tag": "reprocess_error", "id": idp, "integ": integ, "numero": numero, "err": traceback.format_exc()}
+                {"tag": "reprocess_error", "id_pedido": idp, "integ": integ, "numero": numero, "err": traceback.format_exc()}
             )
 
-    return total_ok, total_err, ids_ok, len(rows)
+    return ok, err, ids_ok, len(rows)
 
 
 @app.post("/admin/reprocessar-pendentes")
@@ -403,11 +436,6 @@ async def reprocessar_pedido(
     numero: Optional[str] = None,
     codigo_pedido_integracao: Optional[str] = None,
 ):
-    """
-    Reprocessa um pedido específico.
-    - Pode informar 'numero' que a gente resolve as chaves pelo banco;
-    - ou informar diretamente 'codigo_pedido_integracao'.
-    """
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
 
@@ -440,7 +468,7 @@ async def reprocessar_pedido(
     return {"ok": True, "ref": ref}
 
 
-# Compatibilidade com cron antigo
+# Compat com cron antigo
 @app.post("/admin/run-jobs")
 async def run_jobs(secret: str, limit: int = 50):
     if secret != ADMIN_SECRET:
@@ -451,5 +479,5 @@ async def run_jobs(secret: str, limit: int = 50):
     return {"ok": True, "pendentes_encontrados": found, "processados_ok": ok, "processados_erro": err, "ids_ok": ids_ok}
 
 
-# Para rodar localmente:
+# Rodar local:
 # uvicorn main:app --host 0.0.0.0 --port 8000
