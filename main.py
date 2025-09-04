@@ -1,355 +1,273 @@
-# -*- coding: utf-8 -*-
-import os
-import json
+# main.py
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
-from typing import Optional, Tuple, Dict, Any
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-from starlette.responses import JSONResponse
-from datetime import datetime, date, time, timezone
+from fastapi import FastAPI, HTTPException, Query, Request
 
 # -----------------------------------------------------------------------------
-# Configuração básica
+# Config
 # -----------------------------------------------------------------------------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-logger = logging.getLogger("omie-webhook")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Ex.: postgres://user:pass@host/db
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "julia-matheus")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "um-segredo-forte")
 
 OMIE_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 OMIE_APP_KEY = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET", "")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "julia-matheus")
 
+# -----------------------------------------------------------------------------
+# App / Clients / Logger
+# -----------------------------------------------------------------------------
 app = FastAPI(title="omie-webhook-render")
 
-pool: asyncpg.Pool = None  # será criado no startup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("omie")
+
+http = httpx.AsyncClient(timeout=40)
 
 
 # -----------------------------------------------------------------------------
-# Helpers HTTP
+# DB
 # -----------------------------------------------------------------------------
-def ok(payload: Dict[str, Any], status_code: int = 200) -> JSONResponse:
-    return JSONResponse(content=payload, status_code=status_code)
+async def get_pool() -> asyncpg.Pool:
+    if not hasattr(app.state, "pool"):
+        app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    return app.state.pool
 
 
-def fail(payload: Dict[str, Any], status_code: int = 400) -> JSONResponse:
-    return JSONResponse(content=payload, status_code=status_code)
+SCHEMA_SQL = """
+-- Tabela base
+CREATE TABLE IF NOT EXISTS omie_pedido (
+  pk BIGSERIAL PRIMARY KEY,
+  numero TEXT,
+  id_pedido_omie BIGINT,
+  codigo_pedido_integracao TEXT,
+  status TEXT,
+  recebido_em TIMESTAMPTZ DEFAULT now(),
+  raw_basico JSONB,
+  raw_detalhe JSONB
+);
 
+-- Índices auxiliares
+CREATE INDEX IF NOT EXISTS omie_pedido_status_idx ON omie_pedido (status);
+CREATE INDEX IF NOT EXISTS omie_pedido_recebido_idx ON omie_pedido (recebido_em DESC);
 
-def check_secret(secret: str) -> None:
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-
-# -----------------------------------------------------------------------------
-# Conexão Postgres
-# -----------------------------------------------------------------------------
-def _database_url_from_env() -> str:
-    url = os.getenv("DATABASE_URL")
-    if url:
-        return url
-    host = os.getenv("PGHOST", "localhost")
-    port = os.getenv("PGPORT", "5432")
-    user = os.getenv("PGUSER", "postgres")
-    password = os.getenv("PGPASSWORD", "")
-    database = os.getenv("PGDATABASE", "postgres")
-    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
-
-
-async def ensure_schema(conn: asyncpg.Connection) -> None:
-    # Tabela
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS omie_pedido (
-            pk BIGSERIAL PRIMARY KEY,
-            numero TEXT,
-            id_pedido_omie BIGINT,
-            codigo_pedido_integracao TEXT,
-            raw_basico JSONB,
-            raw_detalhe JSONB,
-            status TEXT,
-            recebido_em TIMESTAMPTZ DEFAULT now()
-        );
-        """
-    )
-    # Único por id da Omie (chave de consulta)
-    await conn.execute(
-        """
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'omie_pedido_uid'
-            ) THEN
-                ALTER TABLE omie_pedido
-                ADD CONSTRAINT omie_pedido_uid UNIQUE (id_pedido_omie);
-            END IF;
-        END$$;
-        """
-    )
-    # Índices auxiliares
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_omie_pedido_status ON omie_pedido(status);")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_omie_pedido_codigo_integ ON omie_pedido(codigo_pedido_integracao);")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_omie_pedido_numero ON omie_pedido(numero);")
+-- Único pelo id da Omie (quando existir)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conname = 'omie_pedido_uid'
+  ) THEN
+    ALTER TABLE omie_pedido
+      ADD CONSTRAINT omie_pedido_uid UNIQUE (id_pedido_omie);
+  END IF;
+END$$;
+"""
 
 
 @app.on_event("startup")
 async def on_startup():
-    global pool
-    pool = await asyncpg.create_pool(_database_url_from_env(), min_size=1, max_size=10)
+    pool = await get_pool()
     async with pool.acquire() as conn:
-        await ensure_schema(conn)
-    logger.info("Pool OK e schema selecionado.")
+        await conn.execute(SCHEMA_SQL)
+    log.info("INFO: { 'tag': 'startup', 'msg': 'Pool OK e esquema selecionado.'}")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await http.aclose()
+    finally:
+        if hasattr(app.state, "pool"):
+            pool: asyncpg.Pool = app.state.pool
+            await pool.close()
 
 
 # -----------------------------------------------------------------------------
-# Omie API
+# Helpers
 # -----------------------------------------------------------------------------
-def _omie_body(call: str, param: dict) -> dict:
-    return {
+def _json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+def _parse_dt(s: str) -> datetime:
+    """Aceita 'YYYY-MM-DD' ou ISO. Assume UTC se não vier TZ."""
+    try:
+        if len(s) == 10:
+            dt = datetime.fromisoformat(s + "T00:00:00")
+        else:
+            dt = datetime.fromisoformat(s)
+    except Exception:
+        raise HTTPException(400, detail="Formato de data inválido.")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def _extract_id_omie(raw: Dict[str, Any]) -> Optional[int]:
+    """
+    Tenta achar um ID numérico do pedido (id da Omie) dentro do JSON recebido.
+    """
+    keys = [
+        ("idPedido",),
+        ("evento", "idPedido"),
+        ("pedido", "idPedido"),
+    ]
+    for path in keys:
+        cur = raw
+        ok = True
+        for p in path:
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                ok = False
+                break
+        if ok and cur is not None:
+            try:
+                # Alguns vêm com pontuação
+                return int(str(cur).replace(".", "").replace(",", ""))
+            except Exception:
+                pass
+    return None
+
+
+def _extract_codigo_integracao(raw: Dict[str, Any]) -> Optional[str]:
+    for k in ("codigo_pedido_integracao", "codigoPedidoIntegracao", "numero", "numPedidoIntegracao"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _numero_from_rawdet(raw_det: Dict[str, Any]) -> Optional[str]:
+    try:
+        return str(
+            raw_det["pedido_venda_produto"]["cabecalho"]["numero_pedido"]
+        )
+    except Exception:
+        return None
+
+
+def _build_omie_consulta_body(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    **AQUI ESTÁ O AJUSTE IMPORTANTE**
+    - Se tiver id numérico da Omie, enviar como `codigo_pedido`
+    - Senão, usar `codigo_pedido_integracao`
+    """
+    if row.get("id_pedido_omie") is not None:
+        try:
+            return {"codigo_pedido": int(row["id_pedido_omie"])}
+        except Exception:
+            return {"codigo_pedido": int(str(row["id_pedido_omie"]).replace(".", "").replace(",", ""))}
+
+    if row.get("codigo_pedido_integracao"):
+        return {"codigo_pedido_integracao": row["codigo_pedido_integracao"]}
+
+    return None
+
+
+async def omie_call(call: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Envelopa a chamada no formato da Omie.
+    """
+    body = {
         "call": call,
         "app_key": OMIE_APP_KEY,
         "app_secret": OMIE_APP_SECRET,
-        "param": [param],
+        "param": [payload],
     }
-
-
-async def omie_consultar_pedido(
-    id_pedido: Optional[int] = None,
-    codigo_integracao: Optional[str] = None,
-) -> dict:
-    if not OMIE_APP_KEY or not OMIE_APP_SECRET:
-        raise RuntimeError("Credenciais OMIE não configuradas (OMIE_APP_KEY/OMIE_APP_SECRET).")
-
-    if not id_pedido and not codigo_integracao:
-        raise ValueError("Informe id_pedido OU codigo_integracao para ConsultarPedido.")
-
-    param: dict = {}
-    if id_pedido:
-        param["idPedido"] = int(id_pedido)
-    if codigo_integracao:
-        param["codigo_pedido_integracao"] = str(codigo_integracao)
-
-    body = _omie_body("ConsultarPedido", param)
-
-    async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(OMIE_URL, json=body)
-        r.raise_for_status()
-        data = r.json()
-
-    # Falhas SOAP da Omie vêm com 'faultstring'
-    if isinstance(data, dict) and data.get("faultstring"):
-        raise RuntimeError(f"OMIE ConsultarPedido falhou: {data.get('faultstring')}")
-
+    r = await http.post(OMIE_URL, json=body)
+    r.raise_for_status()
+    data = r.json()
     return data
 
 
-def _br_date(d: date) -> str:
-    # retorna "dd/mm/aaaa"
-    return d.strftime("%d/%m/%Y")
+async def salvar_basico(conn: asyncpg.Connection, raw: Dict[str, Any]) -> int:
+    numero = raw.get("numero")
+    id_omie = _extract_id_omie(raw)
+    cod_int = _extract_codigo_integracao(raw)
 
+    if id_omie is None and not cod_int:
+        status = "sem_chave"
+    else:
+        status = "pendente_consulta"
 
-def _parse_iso(s: str) -> datetime:
-    # aceita "YYYY-MM-DD" ou "YYYY-MM-DDTHH:MM:SS±ZZ:ZZ"
-    try:
-        if "T" in s:
-            return datetime.fromisoformat(s)
-        # só data -> meia-noite local
-        return datetime.fromisoformat(s + "T00:00:00")
-    except Exception:
-        raise ValueError(f"Data/hora inválida: '{s}'")
-
-
-async def backfill_omie_por_periodo(inicio: str, fim: str, por_pagina: int = 200) -> dict:
+    sql = """
+    INSERT INTO omie_pedido (numero, id_pedido_omie, codigo_pedido_integracao, status, raw_basico)
+    VALUES ($1,$2,$3,$4,$5::jsonb)
+    ON CONFLICT (id_pedido_omie) DO UPDATE
+       SET numero = EXCLUDED.numero,
+           raw_basico = EXCLUDED.raw_basico,
+           recebido_em = now(),
+           status = CASE
+                     WHEN omie_pedido.raw_detalhe IS NOT NULL THEN 'consultado'
+                     ELSE 'pendente_consulta'
+                    END
+    RETURNING pk;
     """
-    Busca pedidos na Omie (ListarPedidos) por período [inicio..fim] (datas),
-    insere/atualiza 'raw_basico' e marca como 'pendente_consulta'.
-    Se 'fim' tiver hora, filtra pedidos do dia final pela hora (via dInc/hInc quando disponível).
-    """
-    if not OMIE_APP_KEY or not OMIE_APP_SECRET:
-        raise RuntimeError("Credenciais OMIE não configuradas (OMIE_APP_KEY/OMIE_APP_SECRET).")
-
-    dt_inicio = _parse_iso(inicio)
-    dt_fim = _parse_iso(fim)
-
-    data_de = _br_date(dt_inicio.date())
-    data_ate = _br_date(dt_fim.date())
-
-    total_importados = 0
-    total_paginas = 1
-    pagina = 1
-
-    async with httpx.AsyncClient(timeout=50) as client, pool.acquire() as conn:
-        await ensure_schema(conn)
-
-        while pagina <= total_paginas:
-            body = _omie_body(
-                "ListarPedidos",
-                {
-                    "pagina": pagina,
-                    "registros_por_pagina": por_pagina,
-                    "apenas_importado_api": "N",
-                    "filtrar_por_data_de": data_de,
-                    "filtrar_por_data_ate": data_ate,
-                    # "ordem_descrescente": "S"  # se quiser garantir ordem
-                },
-            )
-
-            r = await client.post(OMIE_URL, json=body)
-            r.raise_for_status()
-            data = r.json()
-
-            if isinstance(data, dict) and data.get("faultstring"):
-                raise RuntimeError(f"OMIE ListarPedidos falhou: {data.get('faultstring')}")
-
-            total_paginas = int(data.get("total_de_paginas", 1))
-            lista = data.get("pedido_venda_produto", []) or []
-
-            for ped in lista:
-                try:
-                    cab = (ped or {}).get("cabecalho", {}) or {}
-                    info = (ped or {}).get("infoCadastro", {}) or {}
-
-                    id_pedido_omie = cab.get("codigo_pedido")
-                    codigo_integracao = cab.get("codigo_pedido_integracao")
-                    numero = str(cab.get("numero_pedido") or "").strip() or None
-
-                    # se fim tiver hora, filtrar itens do último dia
-                    if dt_inicio.date() <= dt_fim.date() and dt_fim.hour + dt_fim.minute + dt_fim.second > 0:
-                        dInc = info.get("dInc")  # "dd/mm/aaaa"
-                        hInc = info.get("hInc")  # "HH:MM:SS"
-                        if dInc and hInc:
-                            try:
-                                dd, mm, aa = map(int, dInc.split("/"))
-                                hh, mi, ss = map(int, hInc.split(":"))
-                                ts = datetime(aa, mm, dd, hh, mi, ss, tzinfo=dt_fim.tzinfo)
-                                if ts.date() == dt_fim.date() and ts > dt_fim:
-                                    # pula porque é posterior ao corte
-                                    continue
-                            except Exception:
-                                pass  # se não der pra interpretar, não filtramos
-
-                    await conn.execute(
-                        """
-                        INSERT INTO omie_pedido (numero, id_pedido_omie, codigo_pedido_integracao, raw_basico, status)
-                        VALUES ($1, $2, $3, $4::jsonb, 'pendente_consulta')
-                        ON CONFLICT (id_pedido_omie) DO UPDATE
-                           SET raw_basico = EXCLUDED.raw_basico,
-                               status = CASE
-                                           WHEN omie_pedido.raw_detalhe IS NULL THEN 'pendente_consulta'
-                                           ELSE 'consultado'
-                                        END,
-                               recebido_em = now();
-                        """,
-                        numero,
-                        id_pedido_omie,
-                        codigo_integracao,
-                        json.dumps(ped),
-                    )
-                    total_importados += 1
-                except Exception as e:
-                    logger.exception("backfill_insert_error: %s", e)
-
-            pagina += 1
-
-    return {"importados": total_importados, "paginas": total_paginas}
+    pk = await conn.fetchval(sql, numero, id_omie, cod_int, status, _json(raw))
+    return int(pk)
 
 
-# -----------------------------------------------------------------------------
-# Extração dos campos do webhook
-# -----------------------------------------------------------------------------
-def extrair_chaves_webhook(payload: dict) -> Tuple[Optional[str], Optional[int], Optional[str]]:
-    """
-    Retorna: (numero, id_pedido_omie, codigo_integracao)
-    Tenta cobrir variações de nomes de campos que vimos nos exemplos/logs.
-    """
-    numero = (
-        payload.get("numero")
-        or payload.get("numero_pedido")
-        or payload.get("numeroPedido")
-        or None
+async def salvar_detalhe_ok(conn: asyncpg.Connection, pk: int, detalhe: Dict[str, Any]) -> None:
+    numero = _numero_from_rawdet(detalhe)
+    await conn.execute(
+        """
+        UPDATE omie_pedido
+           SET raw_detalhe = $2::jsonb,
+               status = 'consultado',
+               numero = COALESCE($3, numero)
+         WHERE pk = $1
+        """,
+        pk, _json(detalhe), numero
     )
-    # Pode vir string -> tenta converter
-    id_pedido = payload.get("id_pedido") or payload.get("idPedido") or payload.get("codigo_pedido")
-    try:
-        id_pedido = int(id_pedido) if id_pedido is not None else None
-    except Exception:
-        id_pedido = None
 
-    codigo_integracao = (
-        payload.get("codigo_pedido_integracao")
-        or payload.get("codigoPedidoIntegracao")
-        or None
-    )
-    if numero is not None:
-        numero = str(numero)
-    if codigo_integracao is not None:
-        codigo_integracao = str(codigo_integracao)
-    return numero, id_pedido, codigo_integracao
+
+async def marcar_sem_chave(conn: asyncpg.Connection, pk: int) -> None:
+    await conn.execute("UPDATE omie_pedido SET status='erro_sem_chave' WHERE pk=$1", pk)
 
 
 # -----------------------------------------------------------------------------
 # Rotas
 # -----------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "omie-webhook-render"}
+
+
 @app.post("/omie/webhook")
-async def omie_webhook(req: Request):
-    """
-    Recebe o webhook da Omie, salva raw_basico, e marca 'pendente_consulta'
-    quando houver alguma chave consultável (id_pedido / codigo_integracao).
-    """
-    payload = await req.json()
-    numero, id_pedido, codigo_integracao = extrair_chaves_webhook(payload)
-    logger.info({"tag": "omie_webhook_received", "numero_pedido": str(numero), "id_pedido": id_pedido})
+async def omie_webhook(request: Request, token: str = Query(...)):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(403, "token inválido")
 
+    raw = await request.json()
+    log.info(_json({"tag": "omie_webhook_received", "numero": raw.get("numero"), "id_pedido": _extract_id_omie(raw)}))
+
+    pool = await get_pool()
     async with pool.acquire() as conn:
-        await ensure_schema(conn)
-        status_inicial = "pendente_consulta" if (id_pedido or codigo_integracao) else "sem_id"
-
-        # Quando existe id_pedido_omie, usamos upsert com a UNIQUE
-        if id_pedido:
-            await conn.execute(
-                """
-                INSERT INTO omie_pedido (numero, id_pedido_omie, codigo_pedido_integracao, raw_basico, status)
-                VALUES ($1, $2, $3, $4::jsonb, $5)
-                ON CONFLICT (id_pedido_omie) DO UPDATE
-                   SET raw_basico = EXCLUDED.raw_basico,
-                       status = CASE
-                                  WHEN omie_pedido.raw_detalhe IS NULL THEN 'pendente_consulta'
-                                  ELSE 'consultado'
-                               END,
-                       recebido_em = now();
-                """,
-                numero,
-                id_pedido,
-                codigo_integracao,
-                json.dumps(payload),
-                status_inicial,
-            )
-        else:
-            # Sem id, insere um registro (pode haver mais de um enquanto não consultado)
-            await conn.execute(
-                """
-                INSERT INTO omie_pedido (numero, id_pedido_omie, codigo_pedido_integracao, raw_basico, status)
-                VALUES ($1, NULL, $2, $3::jsonb, $4);
-                """,
-                numero,
-                codigo_integracao,
-                json.dumps(payload),
-                status_inicial,
-            )
-
-    return ok({"ok": True})
+        pk = await salvar_basico(conn, raw)
+    return {"ok": True, "pk": pk}
 
 
+# --------------------------- ADM: reprocessar pendentes ----------------------
 @app.post("/admin/reprocessar-pendentes")
-async def admin_reprocessar_pendentes(secret: str, limit: int = 200):
-    check_secret(secret)
-    processados_ok, processados_err, ids_ok = 0, 0, []
+async def reprocessar_pendentes(secret: str = Query(...), limit: int = Query(200)):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "nope")
+
+    pool = await get_pool()
+    ok = err = 0
+    ids_ok: list[int] = []
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -357,63 +275,104 @@ async def admin_reprocessar_pendentes(secret: str, limit: int = 200):
             SELECT pk, id_pedido_omie, codigo_pedido_integracao
               FROM omie_pedido
              WHERE status = 'pendente_consulta'
-               AND (id_pedido_omie IS NOT NULL OR codigo_pedido_integracao IS NOT NULL)
-               AND raw_detalhe IS NULL
              ORDER BY recebido_em ASC
              LIMIT $1
             """,
             limit,
         )
 
-        for r in rows:
-            try:
-                detalhe = await omie_consultar_pedido(
-                    id_pedido=r["id_pedido_omie"],
-                    codigo_integracao=r["codigo_pedido_integracao"],
-                )
-                await conn.execute(
-                    """
-                    UPDATE omie_pedido
-                       SET raw_detalhe = $1::jsonb,
-                           status = 'consultado',
-                           recebido_em = now()
-                     WHERE pk = $2
-                    """,
-                    json.dumps(detalhe),
-                    r["pk"],
-                )
-                processados_ok += 1
-                ids_ok.append(r["id_pedido_omie"])
-            except Exception as e:
-                logger.exception("reprocess_error: %s", e)
-                processados_err += 1
+        for row in rows:
+            pk = int(row["pk"])
+            body = _build_omie_consulta_body(dict(row))
+            if not body:
+                await marcar_sem_chave(conn, pk)
+                err += 1
+                continue
 
-    return ok({
+            try:
+                data = await omie_call("ConsultarPedido", body)
+                if "faultstring" in data:
+                    # Erro de negócio da Omie
+                    log.error(_json({"tag": "omie_response", "pk": pk, "err": data["faultstring"]}))
+                    err += 1
+                    continue
+
+                await salvar_detalhe_ok(conn, pk, data)
+                ids_ok.append(pk)
+                ok += 1
+
+            except httpx.HTTPStatusError as e:
+                log.error(_json({"tag": "http_error", "status": e.response.status_code, "pk": pk}))
+                err += 1
+            except Exception as e:
+                log.exception(e)
+                err += 1
+
+    return {
         "ok": True,
         "pendentes_encontrados": len(rows),
-        "processados_ok": processados_ok,
-        "processados_erro": processados_err,
+        "processados_ok": ok,
+        "processados_erro": err,
         "ids_ok": ids_ok,
-    })
+    }
 
 
+# --------------------------- ADM: reprocessar um pedido ----------------------
 @app.post("/admin/reprocessar-pedido")
-async def admin_reprocessar_pedido(
-    secret: str,
-    numero: Optional[str] = None,
-    id_pedido: Optional[int] = None,
-    codigo_integracao: Optional[str] = None,
+async def reprocessar_pedido(
+    secret: str = Query(...),
+    numero: Optional[str] = Query(None, description="Pode ser o numero (string) que você usa como integração"),
+    id_pedido_omie: Optional[int] = Query(None),
+    codigo_integracao: Optional[str] = Query(None),
 ):
-    check_secret(secret)
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "nope")
+
+    pool = await get_pool()
     async with pool.acquire() as conn:
         row = None
-        if id_pedido:
-            row = await conn.fetchrow("SELECT pk, id_pedido_omie, codigo_pedido_integracao FROM omie_pedido WHERE id_pedido_omie=$1 LIMIT 1", id_pedido)
+        if id_pedido_omie is not None:
+            row = await conn.fetchrow(
+                "SELECT pk, id_pedido_omie, codigo_pedido_integracao FROM omie_pedido WHERE id_pedido_omie=$1",
+                id_pedido_omie,
+            )
+            if not row:
+                # cria stub para processar
+                pk = await conn.fetchval(
+                    """
+                    INSERT INTO omie_pedido (id_pedido_omie, status)
+                    VALUES ($1,'pendente_consulta')
+                    ON CONFLICT (id_pedido_omie) DO NOTHING
+                    RETURNING pk
+                    """,
+                    id_pedido_omie,
+                )
+                if pk is None:
+                    row = await conn.fetchrow(
+                        "SELECT pk, id_pedido_omie, codigo_pedido_integracao FROM omie_pedido WHERE id_pedido_omie=$1",
+                        id_pedido_omie,
+                    )
+                else:
+                    row = await conn.fetchrow("SELECT pk, id_pedido_omie, codigo_pedido_integracao FROM omie_pedido WHERE pk=$1", pk)
+
         elif codigo_integracao:
             row = await conn.fetchrow(
-                "SELECT pk, id_pedido_omie, codigo_pedido_integracao FROM omie_pedido WHERE codigo_pedido_integracao=$1 ORDER BY recebido_em DESC LIMIT 1",
+                """
+                SELECT pk, id_pedido_omie, codigo_pedido_integracao
+                  FROM omie_pedido
+                 WHERE codigo_pedido_integracao = $1
+                 ORDER BY recebido_em DESC
+                 LIMIT 1
+                """,
                 codigo_integracao,
             )
+            if not row:
+                pk = await conn.fetchval(
+                    "INSERT INTO omie_pedido (codigo_pedido_integracao, status) VALUES ($1,'pendente_consulta') RETURNING pk",
+                    codigo_integracao,
+                )
+                row = await conn.fetchrow("SELECT pk, id_pedido_omie, codigo_pedido_integracao FROM omie_pedido WHERE pk=$1", pk)
+
         elif numero:
             row = await conn.fetchrow(
                 "SELECT pk, id_pedido_omie, codigo_pedido_integracao FROM omie_pedido WHERE numero=$1 ORDER BY recebido_em DESC LIMIT 1",
@@ -421,57 +380,118 @@ async def admin_reprocessar_pedido(
             )
 
         if not row:
-            return fail({"detail": "Pedido não encontrado na base"}, 404)
+            raise HTTPException(404, detail="Pedido não encontrado ou sem chave de consulta")
 
-        if not (row["id_pedido_omie"] or row["codigo_pedido_integracao"]):
-            return fail({"detail": "Pedido sem chave de consulta (id/codigo_integracao)"}, 400)
+        body = _build_omie_consulta_body(dict(row))
+        if not body:
+            await marcar_sem_chave(conn, int(row["pk"]))
+            raise HTTPException(422, detail="Sem chave (id ou codigo_pedido_integracao)")
 
-        try:
-            detalhe = await omie_consultar_pedido(
-                id_pedido=row["id_pedido_omie"],
-                codigo_integracao=row["codigo_pedido_integracao"],
-            )
-            await conn.execute(
-                """
-                UPDATE omie_pedido
-                   SET raw_detalhe = $1::jsonb,
-                       status = 'consultado',
-                       recebido_em = now()
-                 WHERE pk = $2
-                """,
-                json.dumps(detalhe),
-                row["pk"],
-            )
-            return ok({"ok": True, "id": row["id_pedido_omie"], "numero": numero})
-        except Exception as e:
-            logger.exception("reprocess_error: %s", e)
-            return fail({"ok": False, "detail": str(e)}, 500)
+        data = await omie_call("ConsultarPedido", body)
+        if "faultstring" in data:
+            raise HTTPException(502, detail=data["faultstring"])
+
+        await salvar_detalhe_ok(conn, int(row["pk"]), data)
+        return {"ok": True, "pk": int(row["pk"])}
 
 
+# --------------------------- ADM: backfill (importa lista) -------------------
 @app.post("/admin/backfill")
-async def admin_backfill(secret: str, inicio: str, fim: str, por_pagina: int = 200):
-    """
-    Ex.: /admin/backfill?secret=julia-matheus&inicio=2025-08-25&fim=2025-09-04T16:57:00-03:00
-    """
-    check_secret(secret)
-    try:
-        resultado = await backfill_omie_por_periodo(inicio, fim, por_pagina)
-        return ok({"ok": True, **resultado})
-    except Exception as e:
-        logger.exception("backfill_error: %s", e)
-        return fail({"ok": False, "error": "backfill_error", "detail": str(e)}, 500)
+async def backfill(
+    secret: str = Query(...),
+    inicio: str = Query(..., description="YYYY-MM-DD ou ISO"),
+    fim: str = Query(..., description="YYYY-MM-DD ou ISO"),
+    por_pagina: int = Query(200, ge=50, le=500),
+):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "nope")
+
+    dt_ini = _parse_dt(inicio)
+    dt_fim = _parse_dt(fim)
+
+    # Omie espera dd/mm/yyyy
+    d_ini = dt_ini.astimezone(timezone.utc).strftime("%d/%m/%Y")
+    d_fim = dt_fim.astimezone(timezone.utc).strftime("%d/%m/%Y")
+
+    importados = 0
+    paginas = 0
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        pagina = 1
+        while True:
+            payload = {
+                "pagina": pagina,
+                "registros_por_pagina": por_pagina,
+                "apenas_importado_api": "N",
+                "filtrar_por_data_de": d_ini,
+                "filtrar_por_data_ate": d_fim,
+                # a API não tem filtro de hora; filtramos depois usando infoCadastro (quando disponível)
+            }
+            data = await omie_call("ListarPedidos", payload)
+            paginas += 1
+
+            lista = data.get("pedido_venda_produto", []) or data.get("lista_pedidos", [])
+            if not isinstance(lista, list):
+                lista = []
+
+            for item in lista:
+                # cada item costuma vir com cabecalho + infoCadastro (depende do plano)
+                # guardamos como "basico" e marcamos para detalhar
+                raw = {
+                    "numero": str(
+                        item.get("cabecalho", {}).get("numero_pedido")
+                        or item.get("numero_pedido")
+                        or ""
+                    ),
+                    "idPedido": item.get("cabecalho", {}).get("codigo_pedido")
+                    or item.get("codigo_pedido"),
+                    "codigo_pedido_integracao": item.get("cabecalho", {}).get("codigo_pedido_integracao")
+                    or item.get("codigo_pedido_integracao"),
+                    "infoCadastro": item.get("infoCadastro", {}),
+                }
+
+                # filtro por hora, se vier infoCadastro
+                try:
+                    d_inc = raw.get("infoCadastro", {}).get("dInc")
+                    h_inc = raw.get("infoCadastro", {}).get("hInc")
+                    if d_inc and h_inc:
+                        dt_inc = datetime.strptime(f"{d_inc} {h_inc}", "%d/%m/%Y %H:%M:%S").replace(tzinfo=timezone.utc)
+                        if not (dt_ini <= dt_inc <= dt_fim):
+                            continue
+                except Exception:
+                    pass
+
+                pk = await salvar_basico(conn, raw)
+                importados += 1
+
+            # paginação
+            tot_paginas = data.get("total_de_paginas") or data.get("nPaginas") or 1
+            if pagina >= int(tot_paginas):
+                break
+            pagina += 1
+
+    return {"ok": True, "importados": importados, "paginas": paginas}
 
 
+# --------------------------- ADM: run-jobs (gatilho simples) -----------------
 @app.post("/admin/run-jobs")
-async def admin_run_jobs(secret: str):
-    check_secret(secret)
-    # Espaço para tarefas rápidas se precisar (atualmente só um ping)
-    return ok({"ok": True, "msg": "jobs disparados"})
+async def run_jobs(secret: str = Query(...), lotes: int = Query(3), limit: int = Query(200)):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "nope")
 
+    total_ok = total_err = total_encontrados = 0
+    for _ in range(max(1, lotes)):
+        r = await reprocessar_pendentes(ADMIN_SECRET, limit)  # type: ignore
+        total_ok += r["processados_ok"]
+        total_err += r["processados_erro"]
+        total_encontrados += r["pendentes_encontrados"]
+        await asyncio.sleep(0.2)
 
-# -----------------------------------------------------------------------------
-# Uvicorn local (opcional)
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    return {
+        "ok": True,
+        "lotes": lotes,
+        "pendentes_encontrados": total_encontrados,
+        "processados_ok": total_ok,
+        "processados_erro": total_err,
+    }
