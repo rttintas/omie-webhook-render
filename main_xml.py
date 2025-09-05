@@ -4,30 +4,34 @@ import json
 import logging
 import traceback
 import hashlib
-from hmac import compare_digest
+import secrets
 from typing import Any, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Query, Form
+from fastapi import FastAPI, HTTPException, Request, Query, Form, Header, Depends
 from fastapi.responses import JSONResponse
+
+# ------------------------------------------------------------
+# App & Logger
+# ------------------------------------------------------------
+app = FastAPI(title="RTT Omie - NFe/XML")
+logger = logging.getLogger("uvicorn.error")
 
 # ------------------------------------------------------------
 # Config
 # ------------------------------------------------------------
-app = FastAPI()
-logger = logging.getLogger("uvicorn.error")
-
 DATABASE_URL    = os.getenv("DATABASE_URL", "")
+
 OMIE_APP_KEY    = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET", "")
 
-# segredo: aceita ADMIN_SECRET_XML (se existir) ou ADMIN_SECRET; remove espaços
-ADMIN_SECRET = (os.getenv("ADMIN_SECRET_XML") or os.getenv("ADMIN_SECRET") or "troque-isto")
-ADMIN_SECRET = (ADMIN_SECRET or "").strip()
+# Segredo: prioriza ADMIN_SECRET_XML; fallback ADMIN_SECRET; remove espaços
+def get_admin_secret_env() -> str:
+    return (os.getenv("ADMIN_SECRET_XML") or os.getenv("ADMIN_SECRET") or "").strip()
 
-# Token só para o endpoint nativo de NFe (se/quando você apontar o webhook pra /xml)
+# Token só para o endpoint nativo de NFe (se/quando você apontar o webhook pra /xml/...)
 OMIE_WEBHOOK_TOKEN_XML = os.getenv("OMIE_WEBHOOK_TOKEN_XML", "")
 
 # HTTP timeouts
@@ -43,6 +47,50 @@ LOOKBACK_DAYS  = int(os.getenv("NFE_LOOKBACK_DAYS", "7"))
 LOOKAHEAD_DAYS = int(os.getenv("NFE_LOOKAHEAD_DAYS", "1"))
 
 _pool: Optional[asyncpg.Pool] = None
+
+# ------------------------------------------------------------
+# DEBUG TEMPORÁRIO — remova após o teste
+# Mostra o tamanho e um hash parcial do segredo carregado (sem vazar valor)
+# Montado em /xml/admin/_debug-secret porque este app é montado em /xml
+@app.get("/admin/_debug-secret")
+@app.get("/xml/admin/_debug-secret")  # alias (evita erro de path duplicado acidental)
+def _debug_secret():
+    s = get_admin_secret_env()
+    return {"env_len": len(s), "env_sha8": hashlib.sha256(s.encode()).hexdigest()[:8]}
+
+# ------------------------------------------------------------
+# Auth: aceita segredo por Header, Bearer, Query e Form
+async def admin_auth(
+    secret_q: Optional[str] = Query(None),
+    secret_f: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
+    x_admin_secret: Optional[str] = Header(None),
+):
+    # prioridade: X-Admin-Secret > Bearer <token> > query > form
+    provided = (
+        x_admin_secret
+        or (authorization.split(" ", 1)[1] if authorization and authorization.startswith("Bearer ") else None)
+        or secret_q
+        or secret_f
+        or ""
+    )
+    provided = provided.strip()
+    env_secret = get_admin_secret_env()
+
+    # diagnóstico leve (sem expor segredo)
+    recv_sha8 = hashlib.sha256(provided.encode()).hexdigest()[:8] if provided else ""
+    env_sha8  = hashlib.sha256(env_secret.encode()).hexdigest()[:8] if env_secret else ""
+    if not secrets.compare_digest(provided, env_secret):
+        try:
+            print({
+                "tag": "nfe_auth_fail",
+                "recv_len": len(provided), "env_len": len(env_secret),
+                "recv_sha8": recv_sha8, "env_sha8": env_sha8
+            })
+        except Exception:
+            pass
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return True
 
 # ------------------------------------------------------------
 # Helpers
@@ -264,6 +312,8 @@ async def healthz():
 
 # ------------------------------------------------------------
 # Webhook NFe (nativo, quando você apontar a Omie para /xml/...)
+# OBS: como este app é montado em /xml, o caminho final fica /xml/omie/xml/webhook
+#     (ou ajuste aqui para outro path caso deseje)
 # ------------------------------------------------------------
 @app.post("/omie/xml/webhook")
 async def omie_xml_webhook(request: Request, token: str = Query(default="")):
@@ -274,7 +324,7 @@ async def omie_xml_webhook(request: Request, token: str = Query(default="")):
     return result
 
 # ------------------------------------------------------------
-# Função pública para MODO COMPAT (mesmo endpoint de pedidos)
+# Função pública para MODO COMPAT (usada pelo app combinado no /omie/webhook)
 # ------------------------------------------------------------
 async def handle_xml_event_from_dict(body: dict) -> dict:
     """Trata um evento de NF-e vindo como dict (modo compat OU endpoint nativo)."""
@@ -316,17 +366,22 @@ async def handle_xml_event_from_dict(body: dict) -> dict:
     async with pool.acquire() as conn:
         await _safe_bootstrap(conn)
         try:
+            # Inbox
             await upsert_inbox_xml(conn, chave, id_nf, id_pedido, numero_nf, serie, dt_emis, danfe_url, body)
+
+            # Tentativa imediata: baixar XML pelo URL do evento (se existir)
             if xml_url:
                 xml_text = await _baixar_url_texto(xml_url)
                 if xml_text:
                     await set_xml_and_status(conn, chave, id_nf, xml_text)
+
         except Exception:
             logger.error({
                 "tag": "omie_nfe_inbox_error",
                 "err": traceback.format_exc(),
                 "chave": chave, "id_nf": id_nf, "numero_nf": numero_nf
             })
+            # aceita para processamento posterior
             return {"ok": False, "accepted": True}
 
     return {"ok": True}
@@ -402,32 +457,21 @@ async def _processar_pendentes(conn: asyncpg.Connection, limit: int):
 
     return ok, err, refs_ok, len(rows)
 
-# ------------------------ Endpoints admin (com proteção anti-espaço) -------
+# ------------------------------------------------------------
+# ADMIN endpoints (com auth robusta)
+# ------------------------------------------------------------
 @app.post("/admin/nfe/reprocessar-pendentes")
 async def nfe_reprocessar_pendentes(
-    secret_q: Optional[str] = Query(None),
+    _: bool = Depends(admin_auth),
     limit_q: Optional[int] = Query(None),
-    secret_f: Optional[str] = Form(None),
     limit_f: Optional[int] = Form(None),
 ):
     try:
-        secret = (secret_q or secret_f or "").strip()
-        if not compare_digest(secret, ADMIN_SECRET):
-            logger.warning({
-                "tag": "nfe_auth_fail",
-                "recv_len": len(secret),
-                "env_len": len(ADMIN_SECRET),
-                "recv_sha8": hashlib.sha256(secret.encode()).hexdigest()[:8],
-                "env_sha8": hashlib.sha256(ADMIN_SECRET.encode()).hexdigest()[:8],
-            })
-            raise HTTPException(status_code=401, detail="unauthorized")
-
         limit = (limit_q if limit_q is not None else limit_f) or 50
         pool = await get_pool()
         async with pool.acquire() as conn:
             await _safe_bootstrap(conn)
             ok, err, refs_ok, found = await _processar_pendentes(conn, limit)
-
         return {"ok": True, "pendentes_encontrados": found, "processados_ok": ok, "processados_erro": err, "refs_ok": refs_ok}
     except HTTPException:
         raise
@@ -437,33 +481,22 @@ async def nfe_reprocessar_pendentes(
 
 @app.post("/admin/nfe/reprocessar")
 async def nfe_reprocessar(
-    secret_q: Optional[str] = Query(None),
+    _: bool = Depends(admin_auth),
     chave_q: Optional[str] = Query(None),
     id_nf_q: Optional[int] = Query(None),
     data_emis_iso_q: Optional[str] = Query(None),
-    secret_f: Optional[str] = Form(None),
     chave_f: Optional[str] = Form(None),
     id_nf_f: Optional[int] = Form(None),
     data_emis_iso_f: Optional[str] = Form(None),
 ):
     try:
-        secret = (secret_q or secret_f or "").strip()
-        if not compare_digest(secret, ADMIN_SECRET):
-            logger.warning({
-                "tag": "nfe_auth_fail",
-                "recv_len": len(secret),
-                "env_len": len(ADMIN_SECRET),
-                "recv_sha8": hashlib.sha256(secret.encode()).hexdigest()[:8],
-                "env_sha8": hashlib.sha256(ADMIN_SECRET.encode()).hexdigest()[:8],
-            })
-            raise HTTPException(status_code=401, detail="unauthorized")
-
-        chave = (chave_q or chave_f or None)
-        id_nf = id_nf_q if id_nf_q is not None else id_nf_f
-        data_emis_iso = data_emis_iso_q or data_emis_iso_f
+        chave = (chave_q or chave_f)
+        id_nf = (id_nf_q if id_nf_q is not None else id_nf_f)
+        data_emis_iso = (data_emis_iso_q or data_emis_iso_f)
 
         if not chave and id_nf is None:
             raise HTTPException(status_code=400, detail="Informe 'chave' ou 'id_nf'")
+
 
         dt_emis = _parse_iso_dt(data_emis_iso) if data_emis_iso else None
         pool = await get_pool()
@@ -471,32 +504,29 @@ async def nfe_reprocessar(
             await _safe_bootstrap(conn)
             if chave:
                 xml_text = await _buscar_xml_por_chave(chave, dt_emis)
-                if xml_text:
-                    await set_xml_and_status(conn, chave, None, xml_text)
-                    ref = {"chave": chave}
-                else:
+                if not xml_text:
                     raise HTTPException(status_code=404, detail="XML não encontrado por chave/datas")
+                await set_xml_and_status(conn, chave, None, xml_text)
+                ref = {"chave": chave}
             else:
                 row = await conn.fetchrow(
                     "SELECT chave, data_emis FROM omie_nfe WHERE id_nf=$1 ORDER BY recebido_em DESC LIMIT 1",
                     id_nf
                 )
-                if row and row["chave"]:
-                    xml_text = await _buscar_xml_por_chave(row["chave"], row["data_emis"])
-                    if xml_text:
-                        await set_xml_and_status(conn, row["chave"], id_nf, xml_text)
-                        ref = {"id_nf": id_nf, "chave": row["chave"]}
-                    else:
-                        raise HTTPException(status_code=404, detail="XML não encontrado para id_nf")
-                else:
+                if not (row and row["chave"]):
                     raise HTTPException(status_code=404, detail="Sem chave associada a esse id_nf")
+                xml_text = await _buscar_xml_por_chave(row["chave"], row["data_emis"])
+                if not xml_text:
+                    raise HTTPException(status_code=404, detail="XML não encontrado para id_nf")
+                await set_xml_and_status(conn, row["chave"], id_nf, xml_text)
+                ref = {"id_nf": id_nf, "chave": row["chave"]}
         return {"ok": True, "ref": ref}
     except HTTPException:
         raise
     except Exception:
         logger.error({"tag": "nfe_reprocess_one_error", "err": traceback.format_exc()})
         return JSONResponse({"ok": False, "error": "internal_error"}, status_code=200)
-# --------------------------------------------------------------------------
 
+# ------------------------------------------------------------
 # Rodar local:
 # uvicorn main_xml:app --host 0.0.0.0 --port 8001
