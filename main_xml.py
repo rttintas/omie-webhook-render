@@ -526,6 +526,26 @@ async def nfe_reprocessar(
     except Exception:
         logger.error({"tag": "nfe_reprocess_one_error", "err": traceback.format_exc()})
         return JSONResponse({"ok": False, "error": "internal_error"}, status_code=200)
+# ---------- DIAGNÓSTICO RÁPIDO ----------
+@app.get("/admin/nfe/_diag")
+async def nfe_diag(_: bool = Depends(admin_auth)):
+    """
+    Verifica conexão com o banco e quantos pendentes existem.
+    NUNCA retorna 401 se o header X-Admin-Secret estiver correto.
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await _safe_bootstrap(conn)
+            pend = await conn.fetchval(
+                "SELECT COUNT(*) FROM omie_nfe WHERE status='pendente_consulta'"
+            )
+        return {"ok": True, "db": "ok", "pendentes": int(pend)}
+    except Exception:
+        logger.error({"tag": "nfe_diag_error", "err": traceback.format_exc()})
+        return JSONResponse({"ok": False, "error": "diag_failed"}, status_code=200)
+# ---------- FIM DIAGNÓSTICO ----------
+
 
 # ------------------------------------------------------------
 # Rodar local:
