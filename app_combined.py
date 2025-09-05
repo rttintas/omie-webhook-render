@@ -23,7 +23,7 @@ def root():
 def healthz():
     return {"status": "healthy", "components": ["pedidos", "nfe_xml"], "compat": True}
 
-# Modo compat via middleware:
+# Middleware COMPAT:
 # - Se for POST em /omie/webhook e o corpo parecer NF-e, tratamos pelo módulo XML;
 # - Caso contrário, deixamos seguir para o app de pedidos normalmente.
 @app.middleware("http")
@@ -43,13 +43,12 @@ async def nfe_compat_middleware(request: Request, call_next):
         except Exception:
             # Em caso de erro na heurística, apenas deixa seguir
             pass
-        # Recoloca o corpo (já está cacheado pelo Starlette), só chamar next
         return await call_next(request)
 
     # Demais rotas seguem o fluxo normal
     return await call_next(request)
 
-# Monte primeiro /xml (serviço NFe com endpoints próprios ex.: /xml/admin/nfe/run-jobs)
+# Monte primeiro /xml (serviço NFe com endpoints próprios ex.: /xml/admin/nfe/reprocessar-pendentes)
 app.mount("/xml", nfe_app)
 
 # Depois monte o serviço de pedidos na raiz (mantém endpoints existentes)

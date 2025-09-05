@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Form
+from fastapi.responses import JSONResponse
 
 # ------------------------------------------------------------
 # Config
@@ -25,8 +26,8 @@ OMIE_APP_SECRET    = os.getenv("OMIE_APP_SECRET", "")
 OMIE_WEBHOOK_TOKEN_XML = os.getenv("OMIE_WEBHOOK_TOKEN_XML", "")
 
 # HTTP timeouts
-OMIE_TIMEOUT       = int(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))
-URL_TIMEOUT        = int(os.getenv("URL_TIMEOUT_SECONDS", "20"))
+OMIE_TIMEOUT       = int(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))  # chamadas API Omie
+URL_TIMEOUT        = int(os.getenv("URL_TIMEOUT_SECONDS", "20"))   # baixar XML por URL
 
 # API Omie XML
 OMIE_XML_URL       = os.getenv("OMIE_XML_URL", "https://app.omie.com.br/api/v1/contador/xml/")
@@ -41,6 +42,8 @@ _pool: Optional[asyncpg.Pool] = None
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+# Campos esperados no webhook (conforme doc da Omie de NF-e):
+# evento.nfe_chave, evento.nfe_xml, evento.nfe_danfe, evento.numero_nf, evento.série, evento.id_nf, evento.id_pedido, evento.data_emis, etc.
 WANTED_CHAVE_KEYS   = {"nfe_chave", "nChave", "chave", "chNFe", "chaveNFe", "nfeChave"}
 WANTED_IDNF_KEYS    = {"id_nf", "nIdNF", "idNFe", "idNotaFiscal"}
 WANTED_IDPED_KEYS   = {"id_pedido", "nIdPedido", "idPedido"}
@@ -274,7 +277,6 @@ async def omie_xml_webhook(request: Request, token: str = Query(default="")):
 
 # ------------------------------------------------------------
 # Função pública para MODO COMPAT (mesmo endpoint de pedidos)
-# Cole pedido: “manda ele completo”
 # ------------------------------------------------------------
 async def handle_xml_event_from_dict(body: dict) -> dict:
     """Trata um evento de NF-e vindo como dict (modo compat OU endpoint nativo)."""
@@ -413,55 +415,93 @@ async def _processar_pendentes(conn: asyncpg.Connection, limit: int):
 
     return ok, err, refs_ok, len(rows)
 
+# ------------------------ PATCH APLICADO AQUI -----------------------------
 @app.post("/admin/nfe/reprocessar-pendentes")
-async def nfe_reprocessar_pendentes(secret: str, limit: int = 50):
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        ok, err, refs_ok, found = await _processar_pendentes(conn, limit)
-    return {"ok": True, "pendentes_encontrados": found, "processados_ok": ok, "processados_erro": err, "refs_ok": refs_ok}
+async def nfe_reprocessar_pendentes(
+    secret_q: Optional[str] = Query(None),
+    limit_q: Optional[int] = Query(None),
+    secret_f: Optional[str] = Form(None),
+    limit_f: Optional[int] = Form(None),
+):
+    """
+    Aceita secret/limit via query OU via form; nunca explode 500 (retorna ok:false).
+    """
+    try:
+        secret = secret_q or secret_f
+        limit = (limit_q if limit_q is not None else limit_f) or 50
+        if secret != ADMIN_SECRET:
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await _safe_bootstrap(conn)
+            ok, err, refs_ok, found = await _processar_pendentes(conn, limit)
+
+        return {"ok": True, "pendentes_encontrados": found, "processados_ok": ok, "processados_erro": err, "refs_ok": refs_ok}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error({"tag": "nfe_reprocess_pendentes_error", "err": traceback.format_exc()})
+        # devolve 200 para não quebrar cron, mas com status no corpo
+        return JSONResponse({"ok": False, "error": "internal_error"}, status_code=200)
 
 @app.post("/admin/nfe/reprocessar")
-async def nfe_reprocessar(secret: str,
-                          chave: Optional[str] = None,
-                          id_nf: Optional[int] = None,
-                          data_emis_iso: Optional[str] = None):
-    if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
+async def nfe_reprocessar(
+    secret_q: Optional[str] = Query(None),
+    chave_q: Optional[str] = Query(None),
+    id_nf_q: Optional[int] = Query(None),
+    data_emis_iso_q: Optional[str] = Query(None),
+    secret_f: Optional[str] = Form(None),
+    chave_f: Optional[str] = Form(None),
+    id_nf_f: Optional[int] = Form(None),
+    data_emis_iso_f: Optional[str] = Form(None),
+):
+    """
+    Pontual por chave OU por id_nf; aceita query ou form; nunca explode 500.
+    """
+    try:
+        secret = secret_q or secret_f
+        if secret != ADMIN_SECRET:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        chave = chave_q or chave_f
+        id_nf = id_nf_q if id_nf_q is not None else id_nf_f
+        data_emis_iso = data_emis_iso_q or data_emis_iso_f
 
-    dt_emis = _parse_iso_dt(data_emis_iso) if data_emis_iso else None
-    if not chave and not id_nf:
-        raise HTTPException(status_code=400, detail="Informe 'chave' ou 'id_nf'")
+        if not chave and id_nf is None:
+            raise HTTPException(status_code=400, detail="Informe 'chave' ou 'id_nf'")
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await _safe_bootstrap(conn)
-        xml_text: Optional[str] = None
-
-        if chave:
-            xml_text = await _buscar_xml_por_chave(chave, dt_emis)
-            if xml_text:
-                await set_xml_and_status(conn, chave, None, xml_text)
-                ref = {"chave": chave}
-            else:
-                raise HTTPException(status_code=404, detail="XML não encontrado por chave/datas")
-        else:
-            row = await conn.fetchrow(
-                "SELECT chave, data_emis FROM omie_nfe WHERE id_nf=$1 ORDER BY recebido_em DESC LIMIT 1",
-                id_nf
-            )
-            if row and row["chave"]:
-                xml_text = await _buscar_xml_por_chave(row["chave"], row["data_emis"])
+        dt_emis = _parse_iso_dt(data_emis_iso) if data_emis_iso else None
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await _safe_bootstrap(conn)
+            if chave:
+                xml_text = await _buscar_xml_por_chave(chave, dt_emis)
                 if xml_text:
-                    await set_xml_and_status(conn, row["chave"], id_nf, xml_text)
-                    ref = {"id_nf": id_nf, "chave": row["chave"]}
+                    await set_xml_and_status(conn, chave, None, xml_text)
+                    ref = {"chave": chave}
                 else:
-                    raise HTTPException(status_code=404, detail="XML não encontrado para id_nf")
+                    raise HTTPException(status_code=404, detail="XML não encontrado por chave/datas")
             else:
-                raise HTTPException(status_code=404, detail="Sem chave associada a esse id_nf")
-
-    return {"ok": True, "ref": ref}
+                row = await conn.fetchrow(
+                    "SELECT chave, data_emis FROM omie_nfe WHERE id_nf=$1 ORDER BY recebido_em DESC LIMIT 1",
+                    id_nf
+                )
+                if row and row["chave"]:
+                    xml_text = await _buscar_xml_por_chave(row["chave"], row["data_emis"])
+                    if xml_text:
+                        await set_xml_and_status(conn, row["chave"], id_nf, xml_text)
+                        ref = {"id_nf": id_nf, "chave": row["chave"]}
+                    else:
+                        raise HTTPException(status_code=404, detail="XML não encontrado para id_nf")
+                else:
+                    raise HTTPException(status_code=404, detail="Sem chave associada a esse id_nf")
+        return {"ok": True, "ref": ref}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error({"tag": "nfe_reprocess_one_error", "err": traceback.format_exc()})
+        return JSONResponse({"ok": False, "error": "internal_error"}, status_code=200)
+# ---------------------- FIM DO PATCH --------------------------------------
 
 # Rodar local:
 # uvicorn main_xml:app --host 0.0.0.0 --port 8001
