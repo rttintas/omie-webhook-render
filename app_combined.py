@@ -29,7 +29,7 @@ def healthz():
 async def nfe_compat_middleware(request: Request, call_next):
     if request.url.path == "/omie/webhook" and request.method.upper() == "POST":
         try:
-            body_bytes = await request.body()
+            body_bytes = await request.body()  # cacheado pelo Starlette
             body_text = body_bytes.decode("utf-8", "ignore")
             if any(k in body_text for k in ["nfe_chave", "chNFe", "chaveNFe", "nfe_xml", "numero_nf", "id_nf"]):
                 try:
@@ -39,9 +39,11 @@ async def nfe_compat_middleware(request: Request, call_next):
                 result = await handle_nfe_dict(parsed)
                 return JSONResponse(result, status_code=200)
         except Exception:
+            # heurística falhou? deixa o app de pedidos tratar
             pass
         return await call_next(request)
 
+    # demais rotas seguem o fluxo normal
     return await call_next(request)
 
 # Monte primeiro /xml (para não ser “engolido” pelo app raiz)
