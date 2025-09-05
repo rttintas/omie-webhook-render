@@ -3,7 +3,7 @@ import json
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# seu serviço de pedidos (existente)
+# serviço de pedidos (existente)
 from main import app as pedidos_app
 
 # serviço NF-e/XML e função compat
