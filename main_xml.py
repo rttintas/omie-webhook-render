@@ -545,6 +545,45 @@ async def nfe_diag(_: bool = Depends(admin_auth)):
         logger.error({"tag": "nfe_diag_error", "err": traceback.format_exc()})
         return JSONResponse({"ok": False, "error": "diag_failed"}, status_code=200)
 # ---------- FIM DIAGNÓSTICO ----------
+# ---------- DIAGNÓSTICOS VERBOSOS ----------
+from fastapi import Depends
+from fastapi.responses import JSONResponse
+
+@app.get("/admin/nfe/_diag_conn")
+async def nfe_diag_conn(_: bool = Depends(admin_auth)):
+    """
+    Testa somente conexão ao Postgres (SELECT 1).
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            v = await conn.fetchval("SELECT 1;")
+        return {"ok": True, "db": "ok", "select1": v}
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": "conn_failed", "type": e.__class__.__name__, "msg": str(e)},
+            status_code=200,
+        )
+
+@app.get("/admin/nfe/_diag_raw")
+async def nfe_diag_raw(_: bool = Depends(admin_auth)):
+    """
+    Igual ao _diag, mas devolve tipo e msg da exception para sabermos a causa.
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await _safe_bootstrap(conn)  # cria tabela se faltar
+            pend = await conn.fetchval(
+                "SELECT COUNT(*) FROM omie_nfe WHERE status='pendente_consulta'"
+            )
+        return {"ok": True, "db": "ok", "pendentes": int(pend)}
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": "diag_failed", "type": e.__class__.__name__, "msg": str(e)},
+            status_code=200,
+        )
+# ---------- FIM DIAGNÓSTICOS ----------
 
 
 # ------------------------------------------------------------
