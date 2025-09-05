@@ -609,7 +609,7 @@ async def backfill_pedidos(
                 importados += 1
             paginas += 1
             page += 1
-    return {"ok": True, "importados": importados, "paginas": paginas}
+    return {"ok": True, "importados": importados, "paginas": paginas, "msg": "Backfill concluído com sucesso."}
 
 # Sync NF-e XML
 @app.post("/admin/sync-xml")
