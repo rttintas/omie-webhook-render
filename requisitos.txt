@@ -1,5 +1,6 @@
 fastapi
-asyncpg
-python-dotenv
 uvicorn
 httpx
+asyncpg
+python-dotenv
+python-multipart
