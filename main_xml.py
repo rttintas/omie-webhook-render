@@ -3,6 +3,8 @@ import os
 import json
 import logging
 import traceback
+import hashlib
+from hmac import compare_digest
 from typing import Any, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
@@ -17,25 +19,28 @@ from fastapi.responses import JSONResponse
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
-DATABASE_URL       = os.getenv("DATABASE_URL", "")
-ADMIN_SECRET       = os.getenv("ADMIN_SECRET", "troque-isto")
-OMIE_APP_KEY       = os.getenv("OMIE_APP_KEY", "")
-OMIE_APP_SECRET    = os.getenv("OMIE_APP_SECRET", "")
+DATABASE_URL    = os.getenv("DATABASE_URL", "")
+OMIE_APP_KEY    = os.getenv("OMIE_APP_KEY", "")
+OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET", "")
+
+# segredo: aceita ADMIN_SECRET_XML (se existir) ou ADMIN_SECRET; remove espaços
+ADMIN_SECRET = (os.getenv("ADMIN_SECRET_XML") or os.getenv("ADMIN_SECRET") or "troque-isto")
+ADMIN_SECRET = (ADMIN_SECRET or "").strip()
 
 # Token só para o endpoint nativo de NFe (se/quando você apontar o webhook pra /xml)
 OMIE_WEBHOOK_TOKEN_XML = os.getenv("OMIE_WEBHOOK_TOKEN_XML", "")
 
 # HTTP timeouts
-OMIE_TIMEOUT       = int(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))  # chamadas API Omie
-URL_TIMEOUT        = int(os.getenv("URL_TIMEOUT_SECONDS", "20"))   # baixar XML por URL
+OMIE_TIMEOUT = int(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))  # chamadas API Omie
+URL_TIMEOUT  = int(os.getenv("URL_TIMEOUT_SECONDS", "20"))   # baixar XML por URL
 
 # API Omie XML
 OMIE_XML_URL       = os.getenv("OMIE_XML_URL", "https://app.omie.com.br/api/v1/contador/xml/")
 OMIE_XML_LIST_CALL = os.getenv("OMIE_XML_LIST_CALL", "ListarDocumentos")
 
 # Janela (dias) para procurar documento por data de emissão quando necessário
-LOOKBACK_DAYS      = int(os.getenv("NFE_LOOKBACK_DAYS", "7"))
-LOOKAHEAD_DAYS     = int(os.getenv("NFE_LOOKAHEAD_DAYS", "1"))
+LOOKBACK_DAYS  = int(os.getenv("NFE_LOOKBACK_DAYS", "7"))
+LOOKAHEAD_DAYS = int(os.getenv("NFE_LOOKAHEAD_DAYS", "1"))
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -44,12 +49,12 @@ _pool: Optional[asyncpg.Pool] = None
 # ------------------------------------------------------------
 # Campos esperados no webhook (conforme doc da Omie de NF-e):
 # evento.nfe_chave, evento.nfe_xml, evento.nfe_danfe, evento.numero_nf, evento.série, evento.id_nf, evento.id_pedido, evento.data_emis, etc.
-WANTED_CHAVE_KEYS   = {"nfe_chave", "nChave", "chave", "chNFe", "chaveNFe", "nfeChave"}
-WANTED_IDNF_KEYS    = {"id_nf", "nIdNF", "idNFe", "idNotaFiscal"}
-WANTED_IDPED_KEYS   = {"id_pedido", "nIdPedido", "idPedido"}
-WANTED_NUM_KEYS     = {"numero_nf", "nNumero", "numero", "numeroNota", "numeroNFe"}
-WANTED_SERIE_KEYS   = {"série", "cSerie", "serie", "serie_nfe"}
-WANTED_XMLURL_KEYS  = {"nfe_xml", "xml_url", "danfe_xml_url"}
+WANTED_CHAVE_KEYS  = {"nfe_chave", "nChave", "chave", "chNFe", "chaveNFe", "nfeChave"}
+WANTED_IDNF_KEYS   = {"id_nf", "nIdNF", "idNFe", "idNotaFiscal"}
+WANTED_IDPED_KEYS  = {"id_pedido", "nIdPedido", "idPedido"}
+WANTED_NUM_KEYS    = {"numero_nf", "nNumero", "numero", "numeroNota", "numeroNFe"}
+WANTED_SERIE_KEYS  = {"série", "cSerie", "serie", "serie_nfe"}
+WANTED_XMLURL_KEYS = {"nfe_xml", "xml_url", "danfe_xml_url"}
 
 def deep_find_first(obj: Any, keys: set[str]) -> Optional[Any]:
     if isinstance(obj, dict):
@@ -85,7 +90,6 @@ def _parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
     try:
-        # exemplos do webhook: "2025-09-02T00:00:00-03:00"
         return datetime.fromisoformat(s)
     except Exception:
         return None
@@ -103,7 +107,6 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 async def _safe_bootstrap(conn: asyncpg.Connection):
-    # Cria tabela própria para NFe
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS omie_nfe (
@@ -183,9 +186,6 @@ async def upsert_inbox_xml(conn: asyncpg.Connection,
                            data_emis: Optional[datetime],
                            danfe_url: Optional[str],
                            raw_evento: dict):
-    """
-    UPSERT por 'chave' (se existir); se não houver, insere sem UNIQUE-key.
-    """
     if chave:
         await conn.execute(
             """
@@ -269,9 +269,8 @@ async def healthz():
 async def omie_xml_webhook(request: Request, token: str = Query(default="")):
     if OMIE_WEBHOOK_TOKEN_XML and token != OMIE_WEBHOOK_TOKEN_XML:
         raise HTTPException(status_code=401, detail="invalid token")
-
     body = await request.json()
-    result = await handle_xml_event_from_dict(body)  # reutiliza a mesma lógica
+    result = await handle_xml_event_from_dict(body)
     return result
 
 # ------------------------------------------------------------
@@ -317,22 +316,17 @@ async def handle_xml_event_from_dict(body: dict) -> dict:
     async with pool.acquire() as conn:
         await _safe_bootstrap(conn)
         try:
-            # Inbox
             await upsert_inbox_xml(conn, chave, id_nf, id_pedido, numero_nf, serie, dt_emis, danfe_url, body)
-
-            # Tentativa imediata: baixar XML pelo URL do evento (se existir)
             if xml_url:
                 xml_text = await _baixar_url_texto(xml_url)
                 if xml_text:
                     await set_xml_and_status(conn, chave, id_nf, xml_text)
-
         except Exception:
             logger.error({
                 "tag": "omie_nfe_inbox_error",
                 "err": traceback.format_exc(),
                 "chave": chave, "id_nf": id_nf, "numero_nf": numero_nf
             })
-            # aceita para processamento posterior
             return {"ok": False, "accepted": True}
 
     return {"ok": True}
@@ -341,9 +335,6 @@ async def handle_xml_event_from_dict(body: dict) -> dict:
 # Reprocesso
 # ------------------------------------------------------------
 def _janela_ddmmaa(dt: Optional[datetime]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Constrói janela DD/MM/AAAA para a consulta, com fallback se dt for None.
-    """
     if dt is None:
         hoje = datetime.now(timezone.utc)
         d_ini = (hoje - timedelta(days=LOOKBACK_DAYS)).astimezone().strftime("%d/%m/%Y")
@@ -355,9 +346,6 @@ def _janela_ddmmaa(dt: Optional[datetime]) -> Tuple[Optional[str], Optional[str]
         return d_ini_dt.strftime("%d/%m/%Y"), d_fim_dt.strftime("%d/%m/%Y")
 
 async def _buscar_xml_por_chave(chave: str, dt_emis: Optional[datetime]) -> Optional[str]:
-    """
-    Estratégia: ListarDocumentos por janela de emissão e filtrar nChave == chave.
-    """
     d_ini, d_fim = _janela_ddmmaa(dt_emis)
     pagina = 1
     while True:
@@ -414,7 +402,7 @@ async def _processar_pendentes(conn: asyncpg.Connection, limit: int):
 
     return ok, err, refs_ok, len(rows)
 
-# ------------------------ PATCH: endpoints admin seguros -------------------
+# ------------------------ Endpoints admin (com proteção anti-espaço) -------
 @app.post("/admin/nfe/reprocessar-pendentes")
 async def nfe_reprocessar_pendentes(
     secret_q: Optional[str] = Query(None),
@@ -422,15 +410,19 @@ async def nfe_reprocessar_pendentes(
     secret_f: Optional[str] = Form(None),
     limit_f: Optional[int] = Form(None),
 ):
-    """
-    Aceita secret/limit via query OU via form; nunca explode 500 (retorna ok:false).
-    """
     try:
-        secret = secret_q or secret_f
-        limit = (limit_q if limit_q is not None else limit_f) or 50
-        if secret != ADMIN_SECRET:
+        secret = (secret_q or secret_f or "").strip()
+        if not compare_digest(secret, ADMIN_SECRET):
+            logger.warning({
+                "tag": "nfe_auth_fail",
+                "recv_len": len(secret),
+                "env_len": len(ADMIN_SECRET),
+                "recv_sha8": hashlib.sha256(secret.encode()).hexdigest()[:8],
+                "env_sha8": hashlib.sha256(ADMIN_SECRET.encode()).hexdigest()[:8],
+            })
             raise HTTPException(status_code=401, detail="unauthorized")
 
+        limit = (limit_q if limit_q is not None else limit_f) or 50
         pool = await get_pool()
         async with pool.acquire() as conn:
             await _safe_bootstrap(conn)
@@ -454,20 +446,24 @@ async def nfe_reprocessar(
     id_nf_f: Optional[int] = Form(None),
     data_emis_iso_f: Optional[str] = Form(None),
 ):
-    """
-    Pontual por chave OU por id_nf; aceita query ou form; nunca explode 500.
-    """
     try:
-        secret = secret_q or secret_f
-        if secret != ADMIN_SECRET:
+        secret = (secret_q or secret_f or "").strip()
+        if not compare_digest(secret, ADMIN_SECRET):
+            logger.warning({
+                "tag": "nfe_auth_fail",
+                "recv_len": len(secret),
+                "env_len": len(ADMIN_SECRET),
+                "recv_sha8": hashlib.sha256(secret.encode()).hexdigest()[:8],
+                "env_sha8": hashlib.sha256(ADMIN_SECRET.encode()).hexdigest()[:8],
+            })
             raise HTTPException(status_code=401, detail="unauthorized")
-        chave = chave_q or chave_f
+
+        chave = (chave_q or chave_f or None)
         id_nf = id_nf_q if id_nf_q is not None else id_nf_f
         data_emis_iso = data_emis_iso_q or data_emis_iso_f
 
         if not chave and id_nf is None:
             raise HTTPException(status_code=400, detail="Informe 'chave' ou 'id_nf'")
-
 
         dt_emis = _parse_iso_dt(data_emis_iso) if data_emis_iso else None
         pool = await get_pool()
