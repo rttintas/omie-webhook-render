@@ -22,7 +22,7 @@ ADMIN_SECRET       = os.getenv("ADMIN_SECRET", "troque-isto")
 OMIE_APP_KEY       = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET    = os.getenv("OMIE_APP_SECRET", "")
 
-# Token só para o endpoint nativo de NFe (quando/SE você migrar o webhook pra /xml)
+# Token só para o endpoint nativo de NFe (se/quando você apontar o webhook pra /xml)
 OMIE_WEBHOOK_TOKEN_XML = os.getenv("OMIE_WEBHOOK_TOKEN_XML", "")
 
 # HTTP timeouts
@@ -135,7 +135,7 @@ async def _safe_bootstrap(conn: asyncpg.Connection):
 async def omie_xml_listar_documentos(d_ini: Optional[str], d_fim: Optional[str],
                                      pagina: int = 1, por_pagina: int = 50) -> dict:
     """
-    Chama ListarDocumentos com janela de emissão (datas no formato DD/MM/AAAA).
+    Chama ListarDocumentos com janela de emissão (datas DD/MM/AAAA).
     """
     payload = {
         "call": OMIE_XML_LIST_CALL,
@@ -272,7 +272,6 @@ async def omie_xml_webhook(request: Request, token: str = Query(default="")):
 
     body = await request.json()
     result = await handle_xml_event_from_dict(body)  # reutiliza a mesma lógica
-    # aqui, como é endpoint dedicado, retornar 200 sempre é aceitável pra Omie
     return result
 
 # ------------------------------------------------------------
@@ -415,7 +414,7 @@ async def _processar_pendentes(conn: asyncpg.Connection, limit: int):
 
     return ok, err, refs_ok, len(rows)
 
-# ------------------------ PATCH APLICADO AQUI -----------------------------
+# ------------------------ PATCH: endpoints admin seguros -------------------
 @app.post("/admin/nfe/reprocessar-pendentes")
 async def nfe_reprocessar_pendentes(
     secret_q: Optional[str] = Query(None),
@@ -442,7 +441,6 @@ async def nfe_reprocessar_pendentes(
         raise
     except Exception:
         logger.error({"tag": "nfe_reprocess_pendentes_error", "err": traceback.format_exc()})
-        # devolve 200 para não quebrar cron, mas com status no corpo
         return JSONResponse({"ok": False, "error": "internal_error"}, status_code=200)
 
 @app.post("/admin/nfe/reprocessar")
@@ -469,6 +467,7 @@ async def nfe_reprocessar(
 
         if not chave and id_nf is None:
             raise HTTPException(status_code=400, detail="Informe 'chave' ou 'id_nf'")
+
 
         dt_emis = _parse_iso_dt(data_emis_iso) if data_emis_iso else None
         pool = await get_pool()
@@ -501,7 +500,7 @@ async def nfe_reprocessar(
     except Exception:
         logger.error({"tag": "nfe_reprocess_one_error", "err": traceback.format_exc()})
         return JSONResponse({"ok": False, "error": "internal_error"}, status_code=200)
-# ---------------------- FIM DO PATCH --------------------------------------
+# --------------------------------------------------------------------------
 
 # Rodar local:
 # uvicorn main_xml:app --host 0.0.0.0 --port 8001
