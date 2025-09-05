@@ -560,8 +560,6 @@ async def reprocessar_pedido(secret: str, numero: Optional[str] = None, codigo_p
             detalhe = await omie_consultar_pedido(codigo_pedido_integracao=str(codigo_pedido_integracao))
             await update_pedido_detalhe(conn, detalhe, codigo_pedido_integracao=str(codigo_pedido_integracao))
             ref = {"codigo_pedido_integracao": codigo_pedido_integracao}
-        else:
-            raise HTTPException(status_code=400, detail="Informe 'numero' ou 'codigo_pedido_integracao'")
     return {"ok": True, "ref": ref}
 
 @app.post("/admin/run-jobs")
