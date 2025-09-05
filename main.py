@@ -225,7 +225,7 @@ async def _omie_pesquisar_pedidos(d_ini: datetime, d_fim: datetime, pagina: int,
             "filtrar_por_data_de": ddmmaaaa(d_ini),
             "filtrar_por_data_ate": ddmmaaaa(d_fim),
             "ordenar_por": "DATA",
-            "ordem_decrescente": "N"
+            "ordem_descrescente": "N"
         }],
     }
     async with httpx.AsyncClient(timeout=httpx.Timeout(OMIE_TIMEOUT)) as client:
@@ -629,7 +629,7 @@ async def sync_xml(
 @app.get("/admin/expedicao-preview")
 async def expedicao_preview(secret: str, limit: int = 50):
     if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
+        raise HTTPException(status_code=401, detail="unauthorized"})
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
