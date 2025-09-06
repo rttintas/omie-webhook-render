@@ -374,9 +374,9 @@ async def run_jobs(secret: str = Query(...)):
                 if not nfe_chave:
                     raise RuntimeError("evento NFe sem chave")
 
-                data_emis = _pick(e, "data_emis", "dEmissao")
-                numero_nf = _pick(e, "numero_nf", "nNumero") or ""
-                serie     = _pick(e, "serie", "cSerie") or ""
+                data_emis  = _pick(e, "data_emis", "dEmissao")
+                numero_nf  = (_pick(e, "numero_nf", "nNumero") or "")
+                serie      = (_pick(e, "serie", "cSerie") or "")
                 emitida_em = _parse_emitida_em(data_emis) if data_emis else None
 
                 xml_b64 = await _fetch_xml_por_chave(session, str(nfe_chave), data_emis)
