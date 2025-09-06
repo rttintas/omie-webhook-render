@@ -1,4 +1,4 @@
-# app_combined.py
+# app_combined.py — Pedidos + XML com reprocesso de ambos
 import os
 import json
 import base64
@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, List
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, Request, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, Request, Depends, HTTPException, Query, BackgroundTasks, Body
 from fastapi.responses import JSONResponse
 
 # =========================
@@ -16,7 +16,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Faltou DATABASE_URL no ambiente")
 
-# tokens (suporta nomes antigos/novos para evitar confusão)
 TOKEN_PEDIDOS = os.getenv("OMIE_WEBHOOK_TOKEN", "um-segredo-forte")
 TOKEN_XML     = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TOKEN", "tiago-nati")
 
@@ -37,7 +36,6 @@ async def get_pool() -> asyncpg.pool.Pool:
     return app.state.pool
 
 async def ensure_schema(conn: asyncpg.Connection) -> None:
-    # fila/auditoria dos eventos de webhook (compartilhada)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           BIGSERIAL PRIMARY KEY,
@@ -56,11 +54,9 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
         status       TEXT
     );
     """)
-    # Garante colunas novas se a tabela já existia
     for col, typ in (("topic","TEXT"),("route","TEXT"),("status","TEXT")):
         await conn.execute(f'ALTER TABLE public.omie_webhook_events ADD COLUMN IF NOT EXISTS "{col}" {typ};')
 
-    # caixa de entrada/resultados de pedidos
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_pedido (
         id_pedido      BIGINT PRIMARY KEY,
@@ -71,7 +67,6 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
     );
     """)
 
-    # XML de NFe (salvo na hora ao chegar o webhook de XML)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe (
         chave_nfe   TEXT PRIMARY KEY,
@@ -129,7 +124,6 @@ async def _insert_event(
 # Omie - consulta de pedido
 # =========================
 async def omie_consultar_pedido(codigo_pedido: int) -> Dict[str, Any]:
-    """Chama ConsultarPedido na Omie; nunca levanta exceção HTTP."""
     if not OMIE_APP_KEY or not OMIE_APP_SECRET:
         return {"ok": False, "motivo": "sem_credencial"}
 
@@ -163,7 +157,7 @@ async def _upsert_pedido(conn: asyncpg.Connection, *, id_pedido: int, numero: Op
     """, int(id_pedido), numero, status, json.dumps(detalhe, ensure_ascii=False) if detalhe else None)
 
 # =========================
-# XML save helper
+# XML helpers
 # =========================
 async def _save_xml_payload(conn: asyncpg.Connection, payload: Dict[str, Any]):
     chave  = _pick(payload, "nfe_chave", "chave_nfe", "chave")
@@ -224,7 +218,6 @@ async def pedidos_webhook(
         body = {}
     headers = request.headers
 
-    # salva evento na fila
     async with pool.acquire() as conn:
         await _insert_event(
             conn,
@@ -236,14 +229,11 @@ async def pedidos_webhook(
             status_text="received",
             topic="omie_pedido",
         )
-
-        # upsert "pendente_consulta" imediato (caixa de entrada)
         idp    = _pick(body, "id_pedido", "codigo_pedido", "codigo")
         numero = _pick(body, "numero_pedido", "numero")
         if idp:
             await _upsert_pedido(conn, id_pedido=int(idp), numero=numero, status="pendente_consulta")
 
-    # dispara processamento em background (não depende do cron)
     if background:
         background.add_task(run_jobs_once)
 
@@ -262,7 +252,6 @@ async def xml_ping(token: str = Query(...)):
 async def xml_webhook(
     request: Request,
     token: str = Query(...),
-    background: BackgroundTasks | None = None,
     pool: asyncpg.Pool = Depends(get_pool),
 ):
     if token != TOKEN_XML:
@@ -275,7 +264,6 @@ async def xml_webhook(
     headers = request.headers
 
     async with pool.acquire() as conn:
-        # registra na fila (auditoria)
         evt_id = await _insert_event(
             conn,
             source="omie",
@@ -286,15 +274,12 @@ async def xml_webhook(
             status_text="recebido",
             topic="nfe",
         )
-        # salva/atualiza XML
         await _save_xml_payload(conn, body)
-        # marca evento como processado
         await conn.execute(
             "UPDATE public.omie_webhook_events SET processed=TRUE, processed_at=NOW(), status='consumido' WHERE id=$1;",
             evt_id
         )
 
-    # (opcional) também pode disparar jobs, mas não é necessário para XML
     return {"ok": True, "stored": True}
 
 # =========================
@@ -302,17 +287,87 @@ async def xml_webhook(
 # =========================
 @app.api_route("/admin/run-jobs", methods=["GET","POST"])
 async def admin_run_jobs(secret: str = Query(...)):
-    # 404 para não revelar a rota se secret não bater
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=404, detail="Not Found")
     summary = await run_jobs_once()
     return {"ok": True, **summary}
 
+# ---- Reprocesso de XML ----
+@app.post("/admin/reprocessar-xml-pendentes")
+async def admin_reprocessar_xml_pendentes(secret: str = Query(...), limit: int = Query(200)):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=404, detail="Not Found")
+    pool = await get_pool()
+    ok = 0
+    total = 0
+    async with pool.acquire() as conn:
+        eventos = await conn.fetch("""
+            SELECT id, payload
+              FROM public.omie_webhook_events
+             WHERE processed IS NOT TRUE
+               AND (event_type ILIKE 'nfe%%'
+                    OR route LIKE '/xml%%'
+                    OR payload ? 'nfe_xml')
+             ORDER BY received_at ASC
+             LIMIT $1;
+        """, limit)
+        total = len(eventos)
+        for e in eventos:
+            try:
+                await _save_xml_payload(conn, e["payload"])
+                await conn.execute(
+                    "UPDATE public.omie_webhook_events SET processed=TRUE, processed_at=NOW(), status='consumido' WHERE id=$1;",
+                    e["id"]
+                )
+                ok += 1
+            except Exception:
+                await conn.execute(
+                    "UPDATE public.omie_webhook_events SET status='erro', http_status=500 WHERE id=$1;",
+                    e["id"]
+                )
+    return {"ok": True, "processados_ok": ok, "lidos": total}
+
+@app.post("/admin/reprocessar-xml")
+async def admin_reprocessar_xml(
+    secret: str = Query(...),
+    evento_id: Optional[int] = Query(None),
+    chave: Optional[str] = Query(None)
+):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not evento_id and not chave:
+        raise HTTPException(status_code=400, detail="informe evento_id ou chave")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = None
+        if evento_id:
+            row = await conn.fetchrow("SELECT id, payload FROM public.omie_webhook_events WHERE id=$1;", evento_id)
+        else:
+            row = await conn.fetchrow("""
+                SELECT id, payload
+                  FROM public.omie_webhook_events
+                 WHERE (payload->>'nfe_chave' = $1
+                        OR payload->>'chave_nfe' = $1
+                        OR payload->>'chave' = $1)
+                 ORDER BY received_at DESC
+                 LIMIT 1;
+            """, chave)
+
+        if not row:
+            return {"ok": False, "msg": "evento não encontrado"}
+
+        await _save_xml_payload(conn, row["payload"])
+        await conn.execute(
+            "UPDATE public.omie_webhook_events SET processed=TRUE, processed_at=NOW(), status='consumido' WHERE id=$1;",
+            row["id"]
+        )
+        return {"ok": True, "event_id": row["id"]}
+
 # =========================
-# Processador de fila
+# Processador de fila (PEDIDOS)
 # =========================
 async def run_jobs_once() -> Dict[str, Any]:
-    """Processa eventos pendentes de PEDIDOS (consulta Omie e atualiza omie_pedido)."""
     pool = await get_pool()
     processed = 0
     errors = 0
@@ -346,7 +401,6 @@ async def run_jobs_once() -> Dict[str, Any]:
 
                         await _upsert_pedido(conn, id_pedido=int(idp), numero=numero, status=status, detalhe=detalhe)
 
-                # marca evento como processado (seja pedido ou outro)
                 await conn.execute(
                     "UPDATE public.omie_webhook_events SET processed=TRUE, processed_at=NOW(), status='done' WHERE id=$1;",
                     evt_id
@@ -355,7 +409,6 @@ async def run_jobs_once() -> Dict[str, Any]:
                 touched_ids.append(evt_id)
             except Exception:
                 errors += 1
-                # marca como error mas não trava a fila
                 await conn.execute(
                     "UPDATE public.omie_webhook_events SET processed=TRUE, processed_at=NOW(), status='error', http_status=500 WHERE id=$1;",
                     evt_id
@@ -364,9 +417,8 @@ async def run_jobs_once() -> Dict[str, Any]:
     return {"processed": processed, "errors": errors, "events": touched_ids}
 
 # =========================
-# Error handler simples
+# Error handler
 # =========================
 @app.exception_handler(Exception)
 async def all_errors_handler(request: Request, exc: Exception):
-    # resposta curta para não vazar stack no provedor de webhook
     return JSONResponse(status_code=500, content={"detail": "internal_error"})
