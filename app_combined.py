@@ -132,6 +132,9 @@ async def _insert_event(
     """
     Insere o evento; a ordem dos placeholders ($1..$9) bate com as colunas.
     """
+    # Converta headers para string JSON antes de inserir
+    headers_json = json.dumps(headers) if headers else None
+    
     row_id = await conn.fetchval(
         """
         INSERT INTO public.omie_webhook_events
@@ -147,7 +150,7 @@ async def _insert_event(
         event_type,
         str(event_id) if event_id is not None else None,
         payload,                              # JSONB aceita dict diretamente
-        dict(headers) if headers else None,   # raw_headers JSONB
+        headers_json,                         # raw_headers como string JSON
         int(http_status) if http_status is not None else None,
         topic,
         route,
@@ -369,11 +372,14 @@ async def admin_run_jobs(secret: str = Query(...)):
 
 # ---- Reprocesso de XML (em lote pendente)
 @app.post("/admin/reprocessar-xml-pendentes")
-async def admin_reprocessar_xml_pendentes(secret: str = Query(...), limit: int = Query(200)):
+async def admin_reprocessar_xml_pendentes(
+    secret: str = Query(...),
+    pool: asyncpg.Pool = Depends(get_pool),
+    limit: int = Query(200)
+):
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=404, detail="Not Found")
 
-    pool = await get_pool()
     ok = 0
     total = 0
     async with pool.acquire() as conn:
@@ -418,13 +424,13 @@ async def admin_reprocessar_xml(
     secret: str = Query(...),
     evento_id: Optional[int] = Query(None),
     chave: Optional[str] = Query(None),
+    pool: asyncpg.Pool = Depends(get_pool),
 ):
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=404, detail="Not Found")
     if not evento_id and not chave:
         raise HTTPException(status_code=400, detail="informe evento_id ou chave")
 
-    pool = await get_pool()
     async with pool.acquire() as conn:
         row = None
         if evento_id:
