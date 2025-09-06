@@ -132,7 +132,7 @@ async def _insert_event(
     """
     Insere o evento; a ordem dos placeholders ($1..$9) bate com as colunas.
     """
-    # Converta headers para string JSON antes de inserir
+    # CORREÇÃO: Converta headers para string JSON antes de inserir
     headers_json = json.dumps(headers) if headers else None
     
     row_id = await conn.fetchval(
@@ -150,7 +150,7 @@ async def _insert_event(
         event_type,
         str(event_id) if event_id is not None else None,
         payload,                              # JSONB aceita dict diretamente
-        headers_json,                         # raw_headers como string JSON
+        headers_json,                         # CORREÇÃO: raw_headers como string JSON
         int(http_status) if http_status is not None else None,
         topic,
         route,
@@ -364,7 +364,10 @@ async def xml_webhook(
 # ADMIN – reprocessos
 # =========================================
 @app.api_route("/admin/run-jobs", methods=["GET", "POST"])
-async def admin_run_jobs(secret: str = Query(...)):
+async def admin_run_jobs(
+    secret: str = Query(...),
+    pool: asyncpg.Pool = Depends(get_pool)  # CORREÇÃO: Adicionado pool como dependência
+):
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=404, detail="Not Found")
     summary = await run_jobs_once()
