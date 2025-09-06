@@ -24,7 +24,7 @@ TOKEN_XML = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TOKEN", "
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET") or os.getenv("ADMIN_JOB_SECRET", "julia-matheus")
 
-XML_WEBHOOK_SAVE = os.getenv("XML_WEBHOOK_SAVE", "omie_nfe_xml")  # por ora usamos omie_nfe_xml
+XML_WEBHOOK_SAVE = os.getenv("XML_WEBHOOK_SAVE", "omie_nfe_xml")
 
 app = FastAPI(title="RTT Omie - Combined (Pedidos + XML)")
 
@@ -50,7 +50,6 @@ async def get_pool() -> asyncpg.pool.Pool:
 # Schema
 # =========================================
 async def ensure_schema(conn: asyncpg.Connection) -> None:
-    # Auditoria/fila de eventos
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           BIGSERIAL PRIMARY KEY,
@@ -72,7 +71,6 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
     for col, typ in (("topic", "TEXT"), ("route", "TEXT"), ("status", "TEXT")):
         await conn.execute(f'ALTER TABLE public.omie_webhook_events ADD COLUMN IF NOT EXISTS "{col}" {typ};')
 
-    # Pedidos
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_pedido (
         id_pedido      BIGINT PRIMARY KEY,
@@ -83,7 +81,6 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
     );
     """)
 
-    # XML de NFe (guardamos base64 + payload)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
         chave_nfe    TEXT PRIMARY KEY,
@@ -117,10 +114,6 @@ async def _insert_event(
     route: Optional[str] = None,
     status_text: Optional[str] = None,
 ) -> int:
-    """
-    Insere o evento na tabela public.omie_webhook_events.
-    A ordem dos placeholders ($1..$9) PRECISA bater com as colunas.
-    """
     row_id = await conn.fetchval(
         """
         INSERT INTO public.omie_webhook_events
@@ -135,8 +128,8 @@ async def _insert_event(
         source,
         event_type,
         str(event_id) if event_id is not None else None,
-        payload,                              # JSONB aceita dict
-        dict(headers) if headers else None,   # raw_headers JSONB
+        payload,
+        dict(headers) if headers else None,
         http_status,
         topic,
         route,
@@ -178,7 +171,6 @@ async def _save_xml_payload(conn: asyncpg.Connection, payload: Dict[str, Any]) -
     if not chave:
         raise ValueError("payload de XML sem chave_nfe")
 
-    # Destino único (omie_nfe_xml)
     await conn.execute(
         """
         INSERT INTO public.omie_nfe_xml (chave_nfe, xml_base64, recebido_em, payload)
