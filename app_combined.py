@@ -3,8 +3,8 @@
 import os
 import json
 import base64
-from datetime import datetime, timedelta
 import re
+from datetime import datetime
 
 import aiohttp
 import asyncpg
@@ -20,15 +20,12 @@ ADMIN_SECRET     = os.getenv("ADMIN_SECRET", "julia-matheus")
 OMIE_APP_KEY     = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET  = os.getenv("OMIE_APP_SECRET") or os.getenv("OMIE_APP_HASH") or ""
 OMIE_BASE        = "https://app.omie.com.br/api/v1"
-OMIE_TIMEOUT     = float(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))
 
-# tokens de webhook (query param ?token=)
+TZ               = os.getenv("TIMEZONE", "America/Sao_Paulo")
+
+# tokens simples para proteger os endpoints de webhook
 TOKEN_PEDIDOS    = os.getenv("OMIE_WEBHOOK_TOKEN", "um-segredo-forte")
 TOKEN_XML        = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TOKEN", "tiago-nati")
-
-# janela padrão quando não temos data de emissão ou para reforçar a busca
-NFE_LOOKBACK_DAYS  = int(os.getenv("NFE_LOOKBACK_DAYS",  "7"))  # dias para trás
-NFE_LOOKAHEAD_DAYS = int(os.getenv("NFE_LOOKAHEAD_DAYS", "0"))  # dias para frente
 
 if not DATABASE_URL:
     raise RuntimeError("Defina DATABASE_URL (Postgres).")
@@ -50,31 +47,33 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    pool = getattr(app.state, "pool", None)
+    pool = app.state.pool
     if pool:
         await pool.close()
 
 # ------------------------------------------------------------------------------
-# Migrações
+# Migrações (tabelas e colunas usadas pelo código)
 # ------------------------------------------------------------------------------
 async def _run_migrations(conn: asyncpg.Connection):
-    # Eventos (fila bruta)
+    # Inbox de eventos
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
-        id           bigserial PRIMARY KEY,
-        source       text NOT NULL DEFAULT 'omie',
-        event_type   text NOT NULL,
-        event_ts     timestamptz NOT NULL DEFAULT now(),
-        event_id     text,
-        route        text,
-        processed    boolean NOT NULL DEFAULT FALSE,
-        status       text,
-        received_at  timestamptz NOT NULL DEFAULT now(),
-        payload      jsonb
+        id            bigserial PRIMARY KEY,
+        source        text,
+        event_type    text,
+        event_id      text,
+        route         text,
+        payload       jsonb,
+        event_ts      timestamptz DEFAULT now(),
+        received_at   timestamptz DEFAULT now(),
+        processed     boolean,
+        processed_at  timestamptz,
+        status        text
     );
     """)
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_event_ts ON public.omie_webhook_events(event_ts);")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_route    ON public.omie_webhook_events(route);")
+    # unicidade por event_id (aceita NULL)
     await conn.execute("""
     DO $$
     BEGIN
@@ -88,22 +87,22 @@ async def _run_migrations(conn: asyncpg.Connection):
     # Pedidos
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_pedido (
-        id                bigserial PRIMARY KEY,
-        id_pedido_omie    bigint UNIQUE,
-        numero            text,
-        valor_total       numeric(15,2),
-        situacao          text,
-        quantidade_itens  integer,
-        cliente_codigo    text,
-        detalhe           jsonb,
-        created_at        timestamptz DEFAULT now(),
-        updated_at        timestamptz,
-        recebido_em       timestamptz DEFAULT now()
+        id                 bigserial PRIMARY KEY,
+        id_pedido_omie     bigint UNIQUE,
+        numero             text,
+        valor_total        numeric(18,2),
+        situacao           text,
+        quantidade_itens   integer,
+        cliente_codigo     text,
+        detalhe            jsonb,
+        created_at         timestamptz DEFAULT now(),
+        updated_at         timestamptz,
+        recebido_em        timestamptz DEFAULT now()
     );
     """)
     await conn.execute("ALTER TABLE public.omie_pedido ADD COLUMN IF NOT EXISTS detalhe jsonb;")
 
-    # NF-e XML
+    # NF-e (cache do XML base64)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
         id           bigserial PRIMARY KEY,
@@ -111,26 +110,18 @@ async def _run_migrations(conn: asyncpg.Connection):
         numero       text,
         serie        text,
         emitida_em   timestamptz,
-        recebido_em  timestamptz DEFAULT now(),
-        xml_base64   text,
         created_at   timestamptz DEFAULT now(),
-        updated_at   timestamptz
+        updated_at   timestamptz,
+        recebido_em  timestamptz DEFAULT now(),
+        xml_base64   text
     );
-    """)
-    # garantir colunas (para bases antigas)
-    await conn.execute("""
-    ALTER TABLE public.omie_nfe_xml
-      ADD COLUMN IF NOT EXISTS created_at  timestamptz DEFAULT now(),
-      ADD COLUMN IF NOT EXISTS updated_at  timestamptz,
-      ADD COLUMN IF NOT EXISTS emitida_em  timestamptz,
-      ADD COLUMN IF NOT EXISTS xml_base64  text;
     """)
 
 # ------------------------------------------------------------------------------
-# Helpers
+# Helpers (safe parsers)
 # ------------------------------------------------------------------------------
 def _event_block(body: dict) -> dict:
-    """Extrai bloco do evento ('event' ou 'evento'), caindo para o topo."""
+    """Extrai o bloco do evento ('event' ou 'evento')."""
     if not isinstance(body, dict):
         return {}
     e = body.get("event")
@@ -141,14 +132,17 @@ def _event_block(body: dict) -> dict:
         return e
     return body
 
-def _pick(d: dict, *keys, default=None):
+def _pick(d, *keys, default=None):
+    """Pega a primeira chave não vazia de um dict. Se d não for dict, retorna default."""
+    if not isinstance(d, dict):
+        return default
     for k in keys:
-        if isinstance(d, dict) and k in d and d[k] not in (None, "", "NULL", "null"):
+        if k in d and d[k] not in (None, "", "NULL", "null"):
             return d[k]
     return default
 
 def _yyyymmdd_from_iso(dt_iso: str) -> str:
-    """'2025-09-06T00:00:00-03:00' -> '06/09/2025'."""
+    """'2025-09-06T00:00:00-03:00' -> '06/09/2025' (string dd/mm/aaaa)."""
     try:
         dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
         return dt.strftime("%d/%m/%Y")
@@ -161,19 +155,33 @@ def _parse_emitida_em(dt_iso: str):
     except Exception:
         return None
 
+def _extract_nfe_chave_from_payload(body: dict) -> str | None:
+    """Tenta achar a chave da NFe em campos ou em links."""
+    e = _event_block(body)
+    chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
+    if chave:
+        return str(chave)
+    for fld in ("nfe_xml", "nfe_danfe", "xml", "xml_base64", "danfe"):
+        v = _pick(e, fld) or (body.get(fld) if isinstance(body, dict) else None)
+        if isinstance(v, str):
+            m = re.search(r"(\d{44})", v)
+            if m:
+                return m.group(1)
+    return None
+
 # ------------------------------------------------------------------------------
 # Omie API
 # ------------------------------------------------------------------------------
 async def _omie_call(session: aiohttp.ClientSession, endpoint: str, call: str, payload: dict):
-    """Chamada Omie (POST JSON)."""
+    """Chamada POST JSON à API Omie."""
     url = f"{OMIE_BASE}/{endpoint}"
     body = {
         "call": call,
         "app_key": OMIE_APP_KEY,
         "app_secret": OMIE_APP_SECRET,
-        "param": [payload],
+        "param": [payload or {}],
     }
-    async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=OMIE_TIMEOUT)) as r:
+    async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
         r.raise_for_status()
         data = await r.json()
         if isinstance(data, dict) and any(k in data for k in ("fault", "faultcode", "faultstring")):
@@ -187,85 +195,31 @@ async def _fetch_pedido_por_codigo(session: aiohttp.ClientSession, codigo_pedido
 
 async def _fetch_xml_por_chave(session: aiohttp.ClientSession, nfe_chave: str, data_emis_iso: str | None) -> str | None:
     """
-    /api/v1/contador/xml/ -> ListarDocumentos: encontra pelo nChave e retorna cXml (base64).
-    Tenta (1) dia exato, (2) janela lookback/lookahead e (3) sem datas.
+    Busca XML via /api/v1/contador/xml/ -> ListarDocumentos.
+    Se vier texto XML, retorna como base64.
     """
-    async def _try(d_ini: str, d_fim: str) -> str | None:
-        payload = {
-            "nPagina": 1,
-            "nRegPorPagina": 200,
-            "cModelo": "55",
-            "dEmiInicial": d_ini,
-            "dEmiFinal": d_fim,
-        }
-        lista = await _omie_call(session, "contador/xml/", "ListarDocumentos", payload)
-        docs = (lista or {}).get("documentosEncontrados") or []
-        for doc in docs:
-            if str(doc.get("nChave")) == str(nfe_chave):
-                cxml = doc.get("cXml")
-                if not cxml:
-                    return None
-                if isinstance(cxml, str) and cxml.lstrip().startswith("<?xml"):
-                    return base64.b64encode(cxml.encode("utf-8")).decode("ascii")
-                return cxml
-        return None
-
-    # 1) dia exato se vier data
-    if data_emis_iso:
-        d = _yyyymmdd_from_iso(data_emis_iso)
-        if d:
-            b64 = await _try(d, d)
-            if b64:
-                return b64
-
-    # 2) janela (lookback/lookahead) baseada na data informada ou hoje
-    base_dt = _parse_emitida_em(data_emis_iso) if data_emis_iso else datetime.utcnow()
-    ini = (base_dt - timedelta(days=NFE_LOOKBACK_DAYS)).strftime("%d/%m/%Y")
-    fim = (base_dt + timedelta(days=NFE_LOOKAHEAD_DAYS)).strftime("%d/%m/%Y")
-    b64 = await _try(ini, fim)
-    if b64:
-        return b64
-
-    # 3) sem datas (últimos lotes permitidos pela Omie)
-    return await _try("", "")
-
-async def _xml_from_event_or_api(session: aiohttp.ClientSession, payload: dict, nfe_chave: str, data_emis_iso: str | None) -> str | None:
-    """
-    Preferir: xml_base64 direto -> texto XML -> URL (baixar) -> API ListarDocumentos.
-    """
-    e = _event_block(payload)
-
-    # a) já base64?
-    xml_b64 = _pick(e, "xml_base64")
-    if isinstance(xml_b64, str) and xml_b64.strip():
-        return xml_b64.strip()
-
-    # b) veio texto XML?
-    raw_xml = _pick(e, "xml") or _pick(e, "nfe_xml")  # às vezes o 'nfe_xml' pode ser XML
-    if isinstance(raw_xml, str) and raw_xml.lstrip().startswith("<?xml"):
-        return base64.b64encode(raw_xml.encode("utf-8")).decode("ascii")
-
-    # c) URL? (nfe_xml / danfe)
-    url = None
-    for fld in ("nfe_xml", "xml", "nfe_danfe"):
-        v = _pick(e, fld) or _pick(payload, fld)
-        if isinstance(v, str) and v.lower().startswith("http"):
-            url = v
-            break
-    if url:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=OMIE_TIMEOUT)) as r:
-                if r.status < 400:
-                    content = await r.read()
-                    return base64.b64encode(content).decode("ascii")
-        except Exception:
-            pass  # cai para a API
-
-    # d) fallback API
-    return await _fetch_xml_por_chave(session, nfe_chave, data_emis_iso)
+    d_ini = d_fim = _yyyymmdd_from_iso(data_emis_iso or "")
+    payload = {
+        "nPagina": 1,
+        "nRegPorPagina": 200,
+        "dEmiIni": d_ini or None,
+        "dEmiFim": d_fim or None,
+        "ordenarPor": "DATA_EMISSAO_DESC",
+    }
+    data = await _omie_call(session, "contador/xml/", "ListarDocumentos", payload)
+    docs = (data.get("documentos") or []) if isinstance(data, dict) else []
+    for doc in docs:
+        if str(doc.get("nChave") or "") == str(nfe_chave):
+            cxml = doc.get("cXml")
+            if not cxml:
+                return None
+            if isinstance(cxml, str) and cxml.lstrip().startswith("<?xml"):
+                return base64.b64encode(cxml.encode("utf-8")).decode("ascii")
+            return cxml
+    return None
 
 # ------------------------------------------------------------------------------
-# Health
+# Health + raiz
 # ------------------------------------------------------------------------------
 @router.get("/healthz")
 async def healthz():
@@ -276,7 +230,7 @@ async def root():
     return {"ok": True, "service": "omie-combined"}
 
 # ------------------------------------------------------------------------------
-# Webhooks
+# Webhooks (Protegidos por token)
 # ------------------------------------------------------------------------------
 @router.post("/omie/webhook")
 async def pedidos_webhook(request: Request, token: str = Query(...)):
@@ -339,6 +293,7 @@ async def run_jobs(secret: str = Query(...)):
     log: list[dict] = []
 
     async with app.state.pool.acquire() as conn, aiohttp.ClientSession() as session:
+
         # 1) Pedidos
         rows = await conn.fetch("""
             SELECT id, payload
@@ -348,17 +303,16 @@ async def run_jobs(secret: str = Query(...)):
              ORDER BY received_at ASC
              LIMIT 200;
         """)
+
         for r in rows:
             try:
                 ev = r["payload"] or {}
                 e  = _event_block(ev)
+
+                # >>> ajuste importante: nunca usar ev.get(...) se ev for string
                 codigo_pedido = (
-                    e.get("idPedido")
-                    or e.get("id_pedido")
-                    or e.get("codigo_pedido")
-                    or ev.get("idPedido")
-                    or ev.get("id_pedido")
-                    or ev.get("codigo_pedido")
+                    _pick(e,  "idPedido", "id_pedido", "codigo_pedido", "codigo")
+                    or _pick(ev, "idPedido", "id_pedido", "codigo_pedido", "codigo")
                 )
                 if not codigo_pedido:
                     raise RuntimeError("evento sem idPedido/codigo_pedido")
@@ -377,39 +331,40 @@ async def run_jobs(secret: str = Query(...)):
 
                 await conn.execute("""
                     INSERT INTO public.omie_pedido
-                      (id_pedido_omie, numero, valor_total, situacao, quantidade_itens,
-                       cliente_codigo, detalhe, recebido_em, created_at)
+                      (id_pedido_omie, numero, valor_total, situacao, quantidade_itens, cliente_codigo, detalhe, created_at, updated_at)
                     VALUES
                       ($1, $2, $3, $4, $5, $6, $7::jsonb, now(), now())
                     ON CONFLICT (id_pedido_omie) DO UPDATE
-                      SET numero = EXCLUDED.numero,
-                          valor_total = EXCLUDED.valor_total,
-                          situacao = EXCLUDED.situacao,
+                      SET numero           = EXCLUDED.numero,
+                          valor_total      = EXCLUDED.valor_total,
+                          situacao         = EXCLUDED.situacao,
                           quantidade_itens = EXCLUDED.quantidade_itens,
-                          cliente_codigo = EXCLUDED.cliente_codigo,
-                          detalhe = EXCLUDED.detalhe,
-                          updated_at = now();
-                """, id_pedido_omie, numero, valor_total, situacao, quantidade_itens,
-                     cliente_codigo, json.dumps(pedido))
+                          cliente_codigo   = EXCLUDED.cliente_codigo,
+                          detalhe          = EXCLUDED.detalhe,
+                          updated_at       = now();
+                """,
+                id_pedido_omie, numero, valor_total, situacao, quantidade_itens, cliente_codigo,
+                json.dumps(pedido))
 
                 await conn.execute("""
                     UPDATE public.omie_webhook_events
-                       SET processed = TRUE, status = 'consumido'
+                       SET processed = TRUE, processed_at = now(), status = 'consumido'
                      WHERE id = $1;
                 """, r["id"])
 
                 processed += 1
                 log.append({"pedido_ok": id_pedido_omie})
+
             except Exception as ex:
                 errors += 1
                 log.append({"pedido_err": str(ex)})
                 await conn.execute("""
                     UPDATE public.omie_webhook_events
-                       SET processed = TRUE, status = $2
+                       SET processed = TRUE, processed_at = now(), status = $2
                      WHERE id = $1;
                 """, r["id"], f"erro:{ex}")
 
-        # 2) NFe XML
+        # 2) NF-e XML
         rows = await conn.fetch("""
             SELECT id, payload
               FROM public.omie_webhook_events
@@ -423,16 +378,9 @@ async def run_jobs(secret: str = Query(...)):
                 ev = r["payload"] or {}
                 e  = _event_block(ev)
 
-                # chave por campos ou extraída de URLs (44 dígitos)
                 nfe_chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
                 if not nfe_chave:
-                    for fld in ("nfe_xml", "nfe_danfe", "xml", "xml_base64"):
-                        v = _pick(e, fld) or _pick(ev, fld)
-                        if isinstance(v, str):
-                            m = re.search(r"(\d{44})", v)
-                            if m:
-                                nfe_chave = m.group(1)
-                                break
+                    nfe_chave = _extract_nfe_chave_from_payload(ev)
                 if not nfe_chave:
                     raise RuntimeError("evento NFe sem chave")
 
@@ -441,13 +389,11 @@ async def run_jobs(secret: str = Query(...)):
                 serie      = (_pick(e, "serie", "cSerie") or "")
                 emitida_em = _parse_emitida_em(data_emis) if data_emis else None
 
-                xml_b64 = await _xml_from_event_or_api(session, ev, str(nfe_chave), data_emis)
-                if not xml_b64:
-                    raise RuntimeError("XML não encontrado (event + API)")
-
+                xml_b64 = await _fetch_xml_por_chave(session, str(nfe_chave), data_emis)
+                # mesmo se não achar XML, salvamos a linha (xml_base64 = NULL)
                 await conn.execute("""
                     INSERT INTO public.omie_nfe_xml
-                      (chave_nfe, numero, serie, emitida_em, recebido_em, xml_base64, created_at)
+                      (chave_nfe, numero, serie, emitida_em, recebido_em, xml_base64, updated_at)
                     VALUES
                       ($1, $2, $3, $4, now(), $5, now())
                     ON CONFLICT (chave_nfe) DO UPDATE
@@ -459,67 +405,72 @@ async def run_jobs(secret: str = Query(...)):
 
                 await conn.execute("""
                     UPDATE public.omie_webhook_events
-                       SET processed = TRUE, status = 'consumido'
+                       SET processed = TRUE, processed_at = now(), status = 'consumido'
                      WHERE id = $1;
                 """, r["id"])
 
                 processed += 1
                 log.append({"nfe_ok": str(nfe_chave)})
+
             except Exception as ex:
                 errors += 1
                 log.append({"nfe_err": str(ex)})
                 await conn.execute("""
                     UPDATE public.omie_webhook_events
-                       SET processed = TRUE, status = $2
+                       SET processed = TRUE, processed_at = now(), status = $2
                      WHERE id = $1;
                 """, r["id"], f"erro:{ex}")
 
     return {"ok": True, "processed": processed, "errors": errors, "events": log}
 
 # ------------------------------------------------------------------------------
-# Admin: checagem rápida de hoje
+# Admin: checagem rápida de hoje (opcional)
 # ------------------------------------------------------------------------------
 @router.get("/admin/check-today")
 async def check_today(secret: str = Query(...)):
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
     async with app.state.pool.acquire() as conn:
-        webhooks_count = await conn.fetchval("""
-            SELECT COUNT(*)
+        fila = await conn.fetch("""
+            SELECT route,
+                   COUNT(*) FILTER (WHERE processed IS NOT TRUE) pendentes,
+                   COUNT(*) FILTER (WHERE processed IS TRUE)  processados,
+                   MAX(received_at)  ultimo_recebido,
+                   MAX(processed_at) ultimo_processado
               FROM public.omie_webhook_events
-             WHERE (event_ts AT TIME ZONE 'America/Sao_Paulo')::date =
-                   (now() AT TIME ZONE 'America/Sao_Paulo')::date;
-        """)
+             WHERE (received_at AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date
+             GROUP BY route
+             ORDER BY route;
+        """, TZ)
         pedidos = await conn.fetch("""
-            SELECT id_pedido_omie, numero, valor_total, situacao, quantidade_itens,
-                   LEFT(COALESCE(detalhe::text,''), 160) AS detalhe_preview, created_at
+            SELECT id_pedido_omie, numero, valor_total, situacao, quantidade_itens, created_at
               FROM public.omie_pedido
-             WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date =
-                   (now() AT TIME ZONE 'America/Sao_Paulo')::date
+             WHERE (created_at AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date
              ORDER BY created_at DESC
              LIMIT 50;
-        """)
+        """, TZ)
         nfe = await conn.fetch("""
             SELECT chave_nfe, numero, serie, emitida_em,
                    CASE WHEN xml_base64 IS NULL THEN 'SEM_XML' ELSE 'OK_XML' END AS xml_status,
-                   LENGTH(COALESCE(xml_base64,'')) AS xml_len, recebido_em
+                   LENGTH(COALESCE(xml_base64,'')) AS xml_len,
+                   recebido_em
               FROM public.omie_nfe_xml
-             WHERE (recebido_em AT TIME ZONE 'America/Sao_Paulo')::date =
-                   (now() AT TIME ZONE 'America/Sao_Paulo')::date
+             WHERE (recebido_em AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date
              ORDER BY recebido_em DESC
              LIMIT 50;
-        """)
+        """, TZ)
     return {
-        "webhooks_today": webhooks_count,
+        "fila": [dict(r) for r in fila],
         "pedidos_today": [dict(r) for r in pedidos],
         "nfe_today": [dict(r) for r in nfe],
     }
 
 # ------------------------------------------------------------------------------
-# Erros
+# Errors
 # ------------------------------------------------------------------------------
 @app.exception_handler(Exception)
 async def all_errors_handler(request: Request, exc: Exception):
+    # resposta simples para não vazar stacktrace
     return JSONResponse(status_code=500, content={"detail": "internal_error"})
 
 # ------------------------------------------------------------------------------
@@ -532,4 +483,4 @@ app.include_router(router)
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app_combined:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    uvicorn.run("app_combined:app", host="0.0.0.0", port=8000, reload=True)
