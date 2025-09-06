@@ -1,6 +1,7 @@
-# app_combined.py — Pedidos + XML com fila de eventos (codec JSON, tópico PT/EN, evento, event_id robusto)
+# app_combined.py — Pedidos + XML com fila de eventos (codec JSON, tópico PT/EN, evento, event_id robusto, chave NFe por regex)
 
 import os
+import re
 import json
 import logging
 from typing import Any, Dict, Optional, List
@@ -33,6 +34,7 @@ app = FastAPI(title="RTT Omie - Combined (Pedidos + XML)")
 # Pool com codecs JSON
 # =========================================
 async def _setup_json_codecs(conn: asyncpg.Connection):
+    # permite passar dict/list direto pra colunas JSON/JSONB
     await conn.set_type_codec('json',  encoder=json.dumps, decoder=json.loads, schema='pg_catalog')
     await conn.set_type_codec('jsonb', encoder=json.dumps, decoder=json.loads, schema='pg_catalog')
 
@@ -128,10 +130,10 @@ def _topic_of(body: Dict[str, Any]) -> str:
 
 def _event_id_of(body: Dict[str, Any]) -> Optional[str]:
     """
-    Define um ID único para o evento:
-      - preferir nfe_chave / idPedido (dentro de 'evento' quando existir)
+    ID único do evento:
+      - preferir nfe_chave / idPedido (em 'evento')
       - cair para nfe_chave no topo
-      - fallback: messageId (único da Omie)
+      - fallback: messageId
       - nunca retornar string vazia
     """
     evt = body.get("evento", {}) if isinstance(body.get("evento", {}), dict) else {}
@@ -168,7 +170,7 @@ async def _insert_event(
         """,
         source,
         event_type,
-        event_id,                 # None se faltar -> não conflita com índice parcial
+        event_id,                 # None se faltar -> OK com índice parcial
         payload,
         headers or {},
         int(http_status) if http_status is not None else None,
@@ -203,11 +205,50 @@ async def _upsert_pedido(
     )
 
 async def _save_xml_payload(conn: asyncpg.Connection, payload: Dict[str, Any]) -> None:
+    """
+    Salva dados de NF-e. Formatos possíveis:
+      { "evento": { "nfe_chave": "...", "nfe_xml": "<URL ou base64>", ... } }
+    ou topo com os mesmos campos.
+
+    Estratégia:
+      1) procurar chave em campos conhecidos;
+      2) extrair 44 dígitos de URLs (nfe_xml/nfe_danfe) via regex;
+      3) fallback: id_nf ou messageId (prefixados) para não quebrar.
+    """
     base = payload.get("evento", {}) if isinstance(payload.get("evento", {}), dict) else payload
-    chave = _pick(base, "nfe_chave", "chave_nfe", "chave")
-    xml_value = _pick(base, "nfe_xml", "xml", "xml_base64")  # pode ser URL ou base64
+
+    # 1) campos conhecidos (variações)
+    chave = (
+        _pick(base,   "nfe_chave", "chave_nfe", "chave", "chNFe", "chaveAcessoNFe", "chaveAcesso")
+        or _pick(payload, "nfe_chave", "chave_nfe", "chave", "chNFe", "chaveAcessoNFe", "chaveAcesso")
+    )
+
+    # 2) extrair da URL se necessário
     if not chave:
-        raise ValueError("payload de XML sem chave_nfe")
+        for campo in ("nfe_xml", "xml", "xml_base64", "nfe_danfe", "danfe"):
+            url = _pick(base, campo) or _pick(payload, campo)
+            if isinstance(url, str):
+                m = re.search(r"(\d{44})", url)
+                if m:
+                    chave = m.group(1)
+                    break
+
+    # 3) fallback seguro
+    if not chave:
+        id_nf = _pick(base, "id_nf", "idNota") or _pick(payload, "id_nf", "idNota")
+        if id_nf:
+            chave = f"idnf:{id_nf}"
+        else:
+            mid = _pick(payload, "messageId", "mensagemId", "message_id")
+            if mid:
+                chave = f"msg:{mid}"
+
+    # Se ainda nada, só registra no log de eventos
+    if not chave:
+        logging.warning("XML sem chave identificável. Payload registrado apenas no log de eventos.")
+        return
+
+    xml_value = _pick(base, "nfe_xml", "xml", "xml_base64") or _pick(payload, "nfe_xml", "xml", "xml_base64")
 
     await conn.execute(
         """
@@ -308,7 +349,7 @@ async def pedidos_webhook(
             conn,
             source="omie",
             event_type="omie_webhook_received",
-            event_id=_event_id_of(body),   # <<< robusto
+            event_id=_event_id_of(body),   # robusto
             payload=body,
             headers=headers,
             http_status=200,
@@ -364,7 +405,7 @@ async def xml_webhook(
             conn,
             source="omie",
             event_type="nfe_xml_received",
-            event_id=_event_id_of(body),   # <<< robusto
+            event_id=_event_id_of(body),   # robusto
             payload=body,
             headers=headers,
             http_status=200,
