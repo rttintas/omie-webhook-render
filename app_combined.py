@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, Depends, HTTPException, Query, BackgroundT
 from fastapi.responses import JSONResponse
 
 # =========================================
-# Configuração por ambiente
+# Config
 # =========================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -130,8 +130,7 @@ async def _insert_event(
     status_text: Optional[str],
 ) -> int:
     """
-    Insere o evento na tabela public.omie_webhook_events.
-    A ordem dos placeholders ($1..$9) PRECISA bater com as colunas.
+    Insere o evento; a ordem dos placeholders ($1..$9) bate com as colunas.
     """
     row_id = await conn.fetchval(
         """
@@ -147,8 +146,8 @@ async def _insert_event(
         source,
         event_type,
         str(event_id) if event_id is not None else None,
-        payload,                            # JSONB aceita dict
-        dict(headers) if headers else None, # JSONB
+        payload,                              # JSONB aceita dict diretamente
+        dict(headers) if headers else None,   # raw_headers JSONB
         int(http_status) if http_status is not None else None,
         topic,
         route,
@@ -194,7 +193,6 @@ async def _save_xml_payload(conn: asyncpg.Connection, payload: Dict[str, Any]) -
     if not chave:
         raise ValueError("payload de XML sem chave_nfe")
 
-    # Destino único (omie_nfe_xml)
     await conn.execute(
         """
         INSERT INTO public.omie_nfe_xml (chave_nfe, xml_base64, recebido_em, payload)
@@ -234,10 +232,8 @@ async def omie_consultar_pedido(codigo_pedido: int) -> Dict[str, Any]:
             except Exception:
                 data = {"raw": r.text}
 
-            # Falha HTTP
             if status >= 400:
                 return {"ok": False, "status": status, "resp": data}
-            # Falha de negócio (faultstring/faultcode)
             if isinstance(data, dict) and any(k in data for k in ("faultstring", "faultcode", "fault")):
                 return {"ok": False, "status": status, "resp": data}
             return {"ok": True, "status": status, "resp": data}
@@ -262,7 +258,7 @@ async def root():
 async def pedidos_webhook(
     request: Request,
     token: str = Query(...),
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks = None,  # FastAPI injeta automaticamente
     pool: asyncpg.Pool = Depends(get_pool),
 ):
     if token != TOKEN_PEDIDOS:
@@ -307,8 +303,9 @@ async def pedidos_webhook(
                 detalhe=None,
             )
 
-    # Dispara processamento da fila em background
-    background_tasks.add_task(run_jobs_once)
+    # Processa a fila em background
+    if background_tasks:
+        background_tasks.add_task(run_jobs_once)
     return {"ok": True, "event_id": evt_id}
 
 # =========================================
@@ -349,6 +346,7 @@ async def xml_webhook(
         )
 
         await _save_xml_payload(conn, body)
+
         # marca evento como processado
         await conn.execute(
             "UPDATE public.omie_webhook_events "
