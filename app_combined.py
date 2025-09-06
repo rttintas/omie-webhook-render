@@ -1,11 +1,11 @@
 # app_combined.py — Omie Webhooks + Reprocesso (Pedidos + NFe XML)
-
 import os
 import json
 import base64
-from datetime import datetime
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import asyncpg
@@ -17,13 +17,19 @@ from fastapi.responses import JSONResponse
 # ------------------------------------------------------------------------------
 DATABASE_URL     = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or ""
 ADMIN_SECRET     = os.getenv("ADMIN_SECRET", "julia-matheus")
+
 OMIE_APP_KEY     = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET  = os.getenv("OMIE_APP_SECRET") or os.getenv("OMIE_APP_HASH") or ""
 OMIE_BASE        = "https://app.omie.com.br/api/v1"
 TZ               = os.getenv("TIMEZONE", "America/Sao_Paulo")
 
+# Tokens dos webhooks
 TOKEN_PEDIDOS    = os.getenv("OMIE_WEBHOOK_TOKEN", "um-segredo-forte")
 TOKEN_XML        = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TOKEN", "tiago-nati")
+
+# Janela de busca quando o evento de NFe não traz data de emissão
+NFE_LOOKBACK_DAYS  = int(os.getenv("NFE_LOOKBACK_DAYS", "7"))   # dias para trás
+NFE_LOOKAHEAD_DAYS = int(os.getenv("NFE_LOOKAHEAD_DAYS", "0"))  # dias para frente
 
 if not DATABASE_URL:
     raise RuntimeError("Defina DATABASE_URL (Postgres).")
@@ -34,16 +40,12 @@ if not DATABASE_URL:
 app    = FastAPI(title="Omie Webhooks + Jobs")
 router = APIRouter()
 
-# -- asyncpg pool com codecs JSON/JSONB
-async def _setup_json_codecs(conn: asyncpg.Connection):
-    await conn.set_type_codec("json",  encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
-    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
-
+# ------------------------------------------------------------------------------
+# Startup / Shutdown
+# ------------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
-    app.state.pool = await asyncpg.create_pool(
-        DATABASE_URL, min_size=1, max_size=5, init=_setup_json_codecs
-    )
+    app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with app.state.pool.acquire() as conn:
         await _run_migrations(conn)
 
@@ -54,10 +56,10 @@ async def shutdown():
         await pool.close()
 
 # ------------------------------------------------------------------------------
-# Migrações
+# Migrações (garante tabelas/colunas usadas pelo código)
 # ------------------------------------------------------------------------------
 async def _run_migrations(conn: asyncpg.Connection):
-    # Eventos
+    # Eventos brutos
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           bigserial PRIMARY KEY,
@@ -72,14 +74,14 @@ async def _run_migrations(conn: asyncpg.Connection):
         payload      jsonb
     );
     """)
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_event_ts  ON public.omie_webhook_events(event_ts);")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_route     ON public.omie_webhook_events(route);")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_event_ts ON public.omie_webhook_events(event_ts);")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_route    ON public.omie_webhook_events(route);")
     await conn.execute("""
     DO $$
     BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'omie_webhook_events_event_id_uniq') THEN
             ALTER TABLE public.omie_webhook_events
-              ADD CONSTRAINT omie_webhook_events_event_id_uniq UNIQUE (event_id);
+            ADD CONSTRAINT omie_webhook_events_event_id_uniq UNIQUE (event_id);
         END IF;
     END$$;
     """)
@@ -102,7 +104,7 @@ async def _run_migrations(conn: asyncpg.Connection):
     """)
     await conn.execute("ALTER TABLE public.omie_pedido ADD COLUMN IF NOT EXISTS detalhe jsonb;")
 
-    # NF-e XML
+    # NFe XML
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
         id           bigserial PRIMARY KEY,
@@ -116,57 +118,65 @@ async def _run_migrations(conn: asyncpg.Connection):
         updated_at   timestamptz
     );
     """)
-    await conn.execute("ALTER TABLE public.omie_nfe_xml ADD COLUMN IF NOT EXISTS xml_base64 text;")
+    # Garantias adicionais caso a tabela já exista sem as colunas
+    await conn.execute("""
+        ALTER TABLE public.omie_nfe_xml
+        ADD COLUMN IF NOT EXISTS created_at  timestamptz DEFAULT now(),
+        ADD COLUMN IF NOT EXISTS updated_at  timestamptz,
+        ADD COLUMN IF NOT EXISTS emitida_em  timestamptz,
+        ADD COLUMN IF NOT EXISTS xml_base64  text;
+    """)
 
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-def _as_dict(x: Any) -> Dict[str, Any]:
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, str):
-        try:
-            return json.loads(x)
-        except Exception:
-            return {}
-    return {}
-
-def _event_block(body: dict) -> dict:
-    if not isinstance(body, dict):
+def _event_block(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Extrai bloco do evento ('event' ou 'evento'), caindo para o topo."""
+    if isinstance(body, dict):
+        e = body.get("event")
+        if isinstance(e, dict):
+            return e
+        e = body.get("evento")
+        if isinstance(e, dict):
+            return e
+        return body
+    # pode ter payload antigo como string
+    try:
+        d = json.loads(body)  # type: ignore[arg-type]
+        return _event_block(d) if isinstance(d, dict) else {}
+    except Exception:
         return {}
-    e = body.get("event")
-    if isinstance(e, dict):
-        return e
-    e = body.get("evento")
-    if isinstance(e, dict):
-        return e
-    return body
 
-def _pick(d: dict, *keys, default=None):
+def _pick(d: Optional[Dict[str, Any]], *keys: str, default=None):
+    if not isinstance(d, dict):
+        return default
     for k in keys:
-        if isinstance(d, dict) and k in d and d[k] not in (None, "", "NULL", "null"):
+        if k in d and d[k] not in (None, "", "NULL", "null"):
             return d[k]
     return default
 
 def _yyyymmdd_from_iso(dt_iso: str) -> str:
+    """'2025-09-06T00:00:00-03:00' -> '06/09/2025' (dd/mm/aaaa)."""
     try:
         dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
         return dt.strftime("%d/%m/%Y")
     except Exception:
         return ""
 
-def _parse_emitida_em(dt_iso: str):
+def _parse_emitida_em(dt_iso: Optional[str]):
+    if not dt_iso:
+        return None
     try:
         return datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
     except Exception:
         return None
 
-def _extract_nfe_chave_from_payload(body: dict) -> str | None:
+def _extract_nfe_chave_from_payload(body: Dict[str, Any]) -> Optional[str]:
     e = _event_block(body)
     chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
     if chave:
         return str(chave)
-    # tenta extrair dos links
+    # tenta extrair de URLs (44 dígitos)
     for fld in ("nfe_xml", "nfe_danfe", "xml", "xml_base64", "danfe"):
         v = _pick(e, fld) or _pick(body, fld)
         if isinstance(v, str):
@@ -199,11 +209,19 @@ async def _fetch_pedido_por_codigo(session: aiohttp.ClientSession, codigo_pedido
                             {"codigo_pedido": int(codigo_pedido)})
     return data.get("pedido_venda_produto") or data
 
-async def _fetch_xml_por_chave(session: aiohttp.ClientSession, nfe_chave: str, data_emis_iso: str | None) -> str | None:
+async def _fetch_xml_por_chave(session: aiohttp.ClientSession, nfe_chave: str, data_emis_iso: Optional[str]) -> Optional[str]:
     """
-    /api/v1/contador/xml/ -> ListarDocumentos: encontra pelo nChave e retorna cXml (base64).
+    /api/v1/contador/xml/ -> ListarDocumentos: encontra pelo nChave e retorna cXml (sempre base64).
+    Se não houver data de emissão no evento, usa uma janela [agora - LOOKBACK ; agora + AHEAD].
     """
-    d_ini = d_fim = _yyyymmdd_from_iso(data_emis_iso or "")
+    if data_emis_iso:
+        d_ini = d_fim = _yyyymmdd_from_iso(data_emis_iso)
+    else:
+        tz = ZoneInfo(TZ)
+        now_tz = datetime.now(tz)
+        d_ini = (now_tz - timedelta(days=NFE_LOOKBACK_DAYS)).strftime("%d/%m/%Y")
+        d_fim = (now_tz + timedelta(days=NFE_LOOKAHEAD_DAYS)).strftime("%d/%m/%Y")
+
     payload = {
         "nPagina": 1,
         "nRegPorPagina": 200,
@@ -218,14 +236,14 @@ async def _fetch_xml_por_chave(session: aiohttp.ClientSession, nfe_chave: str, d
             cxml = doc.get("cXml")
             if not cxml:
                 return None
-            # se vier texto XML, codifica em base64
+            # se veio texto XML, codifica em base64
             if isinstance(cxml, str) and cxml.lstrip().startswith("<?xml"):
                 return base64.b64encode(cxml.encode("utf-8")).decode("ascii")
             return cxml
     return None
 
 # ------------------------------------------------------------------------------
-# Health
+# Rotas básicas
 # ------------------------------------------------------------------------------
 @router.get("/healthz")
 async def healthz():
@@ -298,9 +316,10 @@ async def run_jobs(secret: str = Query(...)):
 
     processed = 0
     errors = 0
-    log: list[dict] = []
+    log: List[Dict[str, Any]] = []
 
     async with app.state.pool.acquire() as conn, aiohttp.ClientSession() as session:
+        # ------------------------
         # 1) Pedidos
         rows = await conn.fetch("""
             SELECT id, payload
@@ -312,16 +331,18 @@ async def run_jobs(secret: str = Query(...)):
         """)
         for r in rows:
             try:
-                ev = _as_dict(r["payload"])
+                ev = r["payload"]
+                if isinstance(ev, str):
+                    try:
+                        ev = json.loads(ev)
+                    except Exception:
+                        ev = {}
+                ev = ev or {}
                 e  = _event_block(ev)
 
                 codigo_pedido = (
-                    e.get("idPedido")
-                    or e.get("id_pedido")
-                    or e.get("codigo_pedido")
-                    or ev.get("idPedido")
-                    or ev.get("id_pedido")
-                    or ev.get("codigo_pedido")
+                    e.get("idPedido") or e.get("id_pedido") or e.get("codigo_pedido")
+                    or ev.get("idPedido") or ev.get("id_pedido") or ev.get("codigo_pedido")
                 )
                 if not codigo_pedido:
                     raise RuntimeError("evento sem idPedido/codigo_pedido")
@@ -373,6 +394,7 @@ async def run_jobs(secret: str = Query(...)):
                      WHERE id = $1;
                 """, r["id"], f"erro:{ex}")
 
+        # ------------------------
         # 2) NFe XML
         rows = await conn.fetch("""
             SELECT id, payload
@@ -384,7 +406,13 @@ async def run_jobs(secret: str = Query(...)):
         """)
         for r in rows:
             try:
-                ev = _as_dict(r["payload"])
+                ev = r["payload"]
+                if isinstance(ev, str):
+                    try:
+                        ev = json.loads(ev)
+                    except Exception:
+                        ev = {}
+                ev = ev or {}
                 e  = _event_block(ev)
 
                 nfe_chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
@@ -396,7 +424,7 @@ async def run_jobs(secret: str = Query(...)):
                 data_emis  = _pick(e, "data_emis", "dEmissao")
                 numero_nf  = (_pick(e, "numero_nf", "nNumero") or "")
                 serie      = (_pick(e, "serie", "cSerie") or "")
-                emitida_em = _parse_emitida_em(data_emis) if data_emis else None
+                emitida_em = _parse_emitida_em(data_emis)
 
                 xml_b64 = await _fetch_xml_por_chave(session, str(nfe_chave), data_emis)
                 if not xml_b64:
@@ -410,6 +438,7 @@ async def run_jobs(secret: str = Query(...)):
                     ON CONFLICT (chave_nfe) DO UPDATE
                       SET numero     = EXCLUDED.numero,
                           serie      = EXCLUDED.serie,
+                          emitida_em = EXCLUDED.emitida_em,
                           xml_base64 = EXCLUDED.xml_base64,
                           updated_at = now();
                 """, str(nfe_chave), str(numero_nf), str(serie), emitida_em, xml_b64)
@@ -449,7 +478,7 @@ async def check_today(secret: str = Query(...)):
         """)
         pedidos = await conn.fetch("""
             SELECT id_pedido_omie, numero, valor_total, situacao, quantidade_itens,
-                   LEFT(COALESCE(detalhe::text,''), 160) AS preview, created_at
+                   LEFT(COALESCE(detalhe::text,''), 160) AS detalhe_preview, created_at
               FROM public.omie_pedido
              WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date =
                    (now() AT TIME ZONE 'America/Sao_Paulo')::date
