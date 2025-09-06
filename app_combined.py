@@ -1,4 +1,10 @@
-# app_combined.py — Pedidos + XML com fila de eventos (codec JSON, tópico PT/EN, evento, event_id robusto, chave NFe por regex)
+# app_combined.py — Pedidos + XML com fila de eventos
+# - Codecs JSON/JSONB no pool
+# - topic/tópico (PT/EN)
+# - event_id robusto (pedido/nfe/messageId)
+# - INSERT idempotente (sem 500 em reenvio)
+# - chave NFe extraída por regex de URLs (44 dígitos) com fallbacks
+# - rotas admin e reprocessos
 
 import os
 import re
@@ -35,8 +41,8 @@ app = FastAPI(title="RTT Omie - Combined (Pedidos + XML)")
 # =========================================
 async def _setup_json_codecs(conn: asyncpg.Connection):
     # permite passar dict/list direto pra colunas JSON/JSONB
-    await conn.set_type_codec('json',  encoder=json.dumps, decoder=json.loads, schema='pg_catalog')
-    await conn.set_type_codec('jsonb', encoder=json.dumps, decoder=json.loads, schema='pg_catalog')
+    await conn.set_type_codec("json",  encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
 
 async def create_pool() -> asyncpg.Pool:
     return await asyncpg.create_pool(
@@ -56,7 +62,8 @@ async def lifespan(app: FastAPI):
     await app.state.pool.close()
 
 app.router.lifespan_context = lifespan
-async def get_pool() -> asyncpg.pool.Pool: return app.state.pool
+async def get_pool() -> asyncpg.pool.Pool:  # type: ignore[attr-defined]
+    return app.state.pool
 
 # =========================================
 # Schema
@@ -158,22 +165,22 @@ async def _insert_event(
     status_text: Optional[str],
 ) -> int:
     """
-    Insere ou reaproveita o evento (idempotente).
-    - Se event_id for NULL: insere normal (UNIQUE permite vários NULLs).
-    - Se event_id existir: ON CONFLICT atualiza no-op e retorna o id da linha existente.
+    Insere o evento de forma idempotente.
+    - Converte "" -> NULL (evita colisão por string vazia).
+    - Se já existir o mesmo event_id, não insere e retorna o ID existente.
+    Requer a constraint UNIQUE (event_id): omie_webhook_events_event_id_uniq
     """
-    row_id = await conn.fetchval(
+    # 1) Tenta inserir; se conflitar com a UNIQUE, não faz nada
+    row = await conn.fetchrow(
         """
         INSERT INTO public.omie_webhook_events
             (source, event_type, event_ts, event_id, payload,
              processed, processed_at, received_at,
              raw_headers, http_status, topic, route, status)
-        VALUES ($1, $2, NOW(), $3, $4,
+        VALUES ($1, $2, NOW(), NULLIF($3, ''), $4,
                 FALSE, NULL, NOW(),
                 $5, $6, $7, $8, $9)
-        ON CONFLICT (event_id)
-        DO UPDATE SET
-            event_id = EXCLUDED.event_id
+        ON CONFLICT ON CONSTRAINT omie_webhook_events_event_id_uniq DO NOTHING
         RETURNING id;
         """,
         source,
@@ -185,6 +192,34 @@ async def _insert_event(
         topic,
         route,
         status_text,
+    )
+    if row:
+        return int(row["id"])
+
+    # 2) Se não inseriu porque já existia, retorna o ID já existente
+    if event_id not in (None, "", "NULL", "null"):
+        existing = await conn.fetchval(
+            "SELECT id FROM public.omie_webhook_events WHERE event_id=$1;",
+            event_id,
+        )
+        if existing:
+            return int(existing)
+
+    # 3) Fallback (caso extremo): registra sem event_id para não perder o evento
+    row_id = await conn.fetchval(
+        """
+        INSERT INTO public.omie_webhook_events
+            (source, event_type, event_ts, event_id, payload,
+             processed, processed_at, received_at,
+             raw_headers, http_status, topic, route, status)
+        VALUES ($1, $2, NOW(), NULL, $3,
+                FALSE, NULL, NOW(),
+                $4, $5, $6, $7, $8)
+        RETURNING id;
+        """,
+        source, event_type, payload, headers or {},
+        int(http_status) if http_status is not None else None,
+        topic, route, status_text,
     )
     return int(row_id)
 
@@ -447,7 +482,7 @@ async def admin_run_jobs(secret: str = Query(...)):
 async def admin_reprocessar_xml_pendentes(
     secret: str = Query(...),
     pool: asyncpg.Pool = Depends(get_pool),
-    limit: int = Query(200)
+    limit: int = Query(200),
 ):
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=404, detail="Not Found")
