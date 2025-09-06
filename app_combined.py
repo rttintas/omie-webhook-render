@@ -27,6 +27,9 @@ TOKEN_XML        = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TO
 if not DATABASE_URL:
     raise RuntimeError("Defina DATABASE_URL (Postgres).")
 
+# ------------------------------------------------------------------------------
+# App
+# ------------------------------------------------------------------------------
 app    = FastAPI(title="Omie Webhooks + Jobs")
 router = APIRouter()
 
@@ -87,9 +90,9 @@ async def _run_migrations(conn: asyncpg.Connection):
         quantidade_itens  integer,
         cliente_codigo    text,
         detalhe           jsonb,
-        recebido_em       timestamptz DEFAULT now(),
         created_at        timestamptz DEFAULT now(),
-        updated_at        timestamptz
+        updated_at        timestamptz,
+        recebido_em       timestamptz DEFAULT now()
     );
     """)
     await conn.execute("ALTER TABLE public.omie_pedido ADD COLUMN IF NOT EXISTS detalhe jsonb;")
@@ -236,6 +239,7 @@ async def pedidos_webhook(request: Request, token: str = Query(...)):
         body = {}
 
     event_id = str(body.get("messageId") or body.get("id") or "")[:64] or None
+
     async with app.state.pool.acquire() as conn:
         await conn.execute(
             """
@@ -261,6 +265,7 @@ async def xml_webhook(request: Request, token: str = Query(...)):
         body = {}
 
     event_id = str(body.get("messageId") or body.get("id") or "")[:64] or None
+
     async with app.state.pool.acquire() as conn:
         await conn.execute(
             """
@@ -346,6 +351,7 @@ async def run_jobs(secret: str = Query(...)):
 
                 processed += 1
                 log.append({"pedido_ok": id_pedido_omie})
+
             except Exception as ex:
                 errors += 1
                 log.append({"pedido_err": str(ex)})
@@ -368,6 +374,7 @@ async def run_jobs(secret: str = Query(...)):
             try:
                 ev = r["payload"] or {}
                 e  = _event_block(ev)
+
                 nfe_chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
                 if not nfe_chave:
                     nfe_chave = _extract_nfe_chave_from_payload(ev)
@@ -389,8 +396,8 @@ async def run_jobs(secret: str = Query(...)):
                     VALUES
                       ($1, $2, $3, $4, now(), $5, now())
                     ON CONFLICT (chave_nfe) DO UPDATE
-                      SET numero = EXCLUDED.numero,
-                          serie  = EXCLUDED.serie,
+                      SET numero     = EXCLUDED.numero,
+                          serie      = EXCLUDED.serie,
                           xml_base64 = EXCLUDED.xml_base64,
                           updated_at = now();
                 """, str(nfe_chave), str(numero_nf), str(serie), emitida_em, xml_b64)
@@ -403,6 +410,7 @@ async def run_jobs(secret: str = Query(...)):
 
                 processed += 1
                 log.append({"nfe_ok": str(nfe_chave)})
+
             except Exception as ex:
                 errors += 1
                 log.append({"nfe_err": str(ex)})
