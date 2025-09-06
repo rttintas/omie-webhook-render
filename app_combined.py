@@ -5,6 +5,7 @@ import json
 import base64
 from datetime import datetime
 import re
+from typing import Any, Dict
 
 import aiohttp
 import asyncpg
@@ -33,12 +34,16 @@ if not DATABASE_URL:
 app    = FastAPI(title="Omie Webhooks + Jobs")
 router = APIRouter()
 
-# ------------------------------------------------------------------------------
-# Startup / Shutdown
-# ------------------------------------------------------------------------------
+# -- asyncpg pool com codecs JSON/JSONB
+async def _setup_json_codecs(conn: asyncpg.Connection):
+    await conn.set_type_codec("json",  encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+
 @app.on_event("startup")
 async def startup():
-    app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    app.state.pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=1, max_size=5, init=_setup_json_codecs
+    )
     async with app.state.pool.acquire() as conn:
         await _run_migrations(conn)
 
@@ -67,14 +72,14 @@ async def _run_migrations(conn: asyncpg.Connection):
         payload      jsonb
     );
     """)
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_event_ts ON public.omie_webhook_events(event_ts);")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_route    ON public.omie_webhook_events(route);")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_event_ts  ON public.omie_webhook_events(event_ts);")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_owe_route     ON public.omie_webhook_events(route);")
     await conn.execute("""
     DO $$
     BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'omie_webhook_events_event_id_uniq') THEN
             ALTER TABLE public.omie_webhook_events
-            ADD CONSTRAINT omie_webhook_events_event_id_uniq UNIQUE (event_id);
+              ADD CONSTRAINT omie_webhook_events_event_id_uniq UNIQUE (event_id);
         END IF;
     END$$;
     """)
@@ -116,8 +121,17 @@ async def _run_migrations(conn: asyncpg.Connection):
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
+def _as_dict(x: Any) -> Dict[str, Any]:
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return {}
+    return {}
+
 def _event_block(body: dict) -> dict:
-    """Extrai bloco do evento ('event' ou 'evento'), caindo para o topo."""
     if not isinstance(body, dict):
         return {}
     e = body.get("event")
@@ -135,7 +149,6 @@ def _pick(d: dict, *keys, default=None):
     return default
 
 def _yyyymmdd_from_iso(dt_iso: str) -> str:
-    """'2025-09-06T00:00:00-03:00' -> '06/09/2025' (string dd/mm/aaaa)."""
     try:
         dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
         return dt.strftime("%d/%m/%Y")
@@ -239,7 +252,6 @@ async def pedidos_webhook(request: Request, token: str = Query(...)):
         body = {}
 
     event_id = str(body.get("messageId") or body.get("id") or "")[:64] or None
-
     async with app.state.pool.acquire() as conn:
         await conn.execute(
             """
@@ -265,7 +277,6 @@ async def xml_webhook(request: Request, token: str = Query(...)):
         body = {}
 
     event_id = str(body.get("messageId") or body.get("id") or "")[:64] or None
-
     async with app.state.pool.acquire() as conn:
         await conn.execute(
             """
@@ -301,8 +312,9 @@ async def run_jobs(secret: str = Query(...)):
         """)
         for r in rows:
             try:
-                ev = r["payload"] or {}
+                ev = _as_dict(r["payload"])
                 e  = _event_block(ev)
+
                 codigo_pedido = (
                     e.get("idPedido")
                     or e.get("id_pedido")
@@ -372,7 +384,7 @@ async def run_jobs(secret: str = Query(...)):
         """)
         for r in rows:
             try:
-                ev = r["payload"] or {}
+                ev = _as_dict(r["payload"])
                 e  = _event_block(ev)
 
                 nfe_chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
