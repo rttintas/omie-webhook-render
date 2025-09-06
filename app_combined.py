@@ -1,5 +1,4 @@
-# app_combined.py
-# FastAPI + asyncpg + Omie webhooks + reprocesso (ConsultarPedido / ListarDocumentos)
+# app_combined.py — Omie Webhooks + Reprocesso (Pedidos + NFe XML)
 
 import os
 import json
@@ -14,12 +13,12 @@ from fastapi.responses import JSONResponse
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
-DATABASE_URL   = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or ""
-ADMIN_SECRET   = os.getenv("ADMIN_SECRET", "julia-matheus")
-OMIE_APP_KEY   = os.getenv("OMIE_APP_KEY", "")
-OMIE_APP_SECRET= os.getenv("OMIE_APP_SECRET") or os.getenv("OMIE_APP_HASH") or ""
-OMIE_BASE      = "https://app.omie.com.br/api/v1"
-TZ             = os.getenv("TIMEZONE", "America/Sao_Paulo")
+DATABASE_URL    = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or ""
+ADMIN_SECRET    = os.getenv("ADMIN_SECRET", "julia-matheus")
+OMIE_APP_KEY    = os.getenv("OMIE_APP_KEY", "")
+OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET") or os.getenv("OMIE_APP_HASH") or ""
+OMIE_BASE       = "https://app.omie.com.br/api/v1"
+TZ              = os.getenv("TIMEZONE", "America/Sao_Paulo")
 
 if not DATABASE_URL:
     raise RuntimeError("Defina DATABASE_URL (Postgres).")
@@ -66,9 +65,7 @@ async def _run_migrations(conn: asyncpg.Connection):
     await conn.execute("""
     DO $$
     BEGIN
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_constraint WHERE conname = 'omie_webhook_events_event_id_uniq'
-        ) THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'omie_webhook_events_event_id_uniq') THEN
             ALTER TABLE public.omie_webhook_events
             ADD CONSTRAINT omie_webhook_events_event_id_uniq UNIQUE (event_id);
         END IF;
