@@ -29,9 +29,6 @@ TOKEN_XML = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TOKEN", "
 # Segredo admin (para rotas /admin)
 ADMIN_SECRET = os.getenv("ADMIN_SECRET") or os.getenv("ADMIN_JOB_SECRET", "julia-matheus")
 
-# Onde salvar XML (tabela)
-XML_WEBHOOK_SAVE = os.getenv("XML_WEBHOOK_SAVE", "omie_nfe_xml")
-
 app = FastAPI(title="RTT Omie - Combined (Pedidos + XML)")
 
 # =========================================
@@ -88,12 +85,14 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
             status        TEXT
         );
         """
-    );
-    -- Garante colunas novas se a tabela já existia
+    )
+    # Garante colunas novas se a tabela já existia
     for col, typ in (("topic", "TEXT"), ("route", "TEXT"), ("status", "TEXT")):
-        await conn.execute(f'ALTER TABLE public.omie_webhook_events ADD COLUMN IF NOT EXISTS "{col}" {typ};')
+        await conn.execute(
+            f'ALTER TABLE public.omie_webhook_events ADD COLUMN IF NOT EXISTS "{col}" {typ};'
+        )
 
-    # Pedidos
+    # Pedidos (exemplo simples; ajuste conforme seu modelo final)
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS public.omie_pedido (
