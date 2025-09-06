@@ -1,11 +1,10 @@
 # app_combined.py — Omie Webhooks + Reprocesso (Pedidos + NFe XML)
+
 import os
 import json
 import base64
-import re
-from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+import re
 
 import aiohttp
 import asyncpg
@@ -21,14 +20,14 @@ ADMIN_SECRET     = os.getenv("ADMIN_SECRET", "julia-matheus")
 OMIE_APP_KEY     = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET  = os.getenv("OMIE_APP_SECRET") or os.getenv("OMIE_APP_HASH") or ""
 OMIE_BASE        = "https://app.omie.com.br/api/v1"
-TZ               = os.getenv("TIMEZONE", "America/Sao_Paulo")
+OMIE_TIMEOUT     = float(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))
 
-# Tokens dos webhooks
+# tokens de webhook (query param ?token=)
 TOKEN_PEDIDOS    = os.getenv("OMIE_WEBHOOK_TOKEN", "um-segredo-forte")
 TOKEN_XML        = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TOKEN", "tiago-nati")
 
-# Janela de busca quando o evento de NFe não traz data de emissão
-NFE_LOOKBACK_DAYS  = int(os.getenv("NFE_LOOKBACK_DAYS", "7"))   # dias para trás
+# janela padrão quando não temos data de emissão ou para reforçar a busca
+NFE_LOOKBACK_DAYS  = int(os.getenv("NFE_LOOKBACK_DAYS",  "7"))  # dias para trás
 NFE_LOOKAHEAD_DAYS = int(os.getenv("NFE_LOOKAHEAD_DAYS", "0"))  # dias para frente
 
 if not DATABASE_URL:
@@ -56,10 +55,10 @@ async def shutdown():
         await pool.close()
 
 # ------------------------------------------------------------------------------
-# Migrações (garante tabelas/colunas usadas pelo código)
+# Migrações
 # ------------------------------------------------------------------------------
 async def _run_migrations(conn: asyncpg.Connection):
-    # Eventos brutos
+    # Eventos (fila bruta)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           bigserial PRIMARY KEY,
@@ -104,7 +103,7 @@ async def _run_migrations(conn: asyncpg.Connection):
     """)
     await conn.execute("ALTER TABLE public.omie_pedido ADD COLUMN IF NOT EXISTS detalhe jsonb;")
 
-    # NFe XML
+    # NF-e XML
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
         id           bigserial PRIMARY KEY,
@@ -118,72 +117,49 @@ async def _run_migrations(conn: asyncpg.Connection):
         updated_at   timestamptz
     );
     """)
-    # Garantias adicionais caso a tabela já exista sem as colunas
+    # garantir colunas (para bases antigas)
     await conn.execute("""
-        ALTER TABLE public.omie_nfe_xml
-        ADD COLUMN IF NOT EXISTS created_at  timestamptz DEFAULT now(),
-        ADD COLUMN IF NOT EXISTS updated_at  timestamptz,
-        ADD COLUMN IF NOT EXISTS emitida_em  timestamptz,
-        ADD COLUMN IF NOT EXISTS xml_base64  text;
+    ALTER TABLE public.omie_nfe_xml
+      ADD COLUMN IF NOT EXISTS created_at  timestamptz DEFAULT now(),
+      ADD COLUMN IF NOT EXISTS updated_at  timestamptz,
+      ADD COLUMN IF NOT EXISTS emitida_em  timestamptz,
+      ADD COLUMN IF NOT EXISTS xml_base64  text;
     """)
 
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-def _event_block(body: Dict[str, Any]) -> Dict[str, Any]:
+def _event_block(body: dict) -> dict:
     """Extrai bloco do evento ('event' ou 'evento'), caindo para o topo."""
-    if isinstance(body, dict):
-        e = body.get("event")
-        if isinstance(e, dict):
-            return e
-        e = body.get("evento")
-        if isinstance(e, dict):
-            return e
-        return body
-    # pode ter payload antigo como string
-    try:
-        d = json.loads(body)  # type: ignore[arg-type]
-        return _event_block(d) if isinstance(d, dict) else {}
-    except Exception:
+    if not isinstance(body, dict):
         return {}
+    e = body.get("event")
+    if isinstance(e, dict):
+        return e
+    e = body.get("evento")
+    if isinstance(e, dict):
+        return e
+    return body
 
-def _pick(d: Optional[Dict[str, Any]], *keys: str, default=None):
-    if not isinstance(d, dict):
-        return default
+def _pick(d: dict, *keys, default=None):
     for k in keys:
-        if k in d and d[k] not in (None, "", "NULL", "null"):
+        if isinstance(d, dict) and k in d and d[k] not in (None, "", "NULL", "null"):
             return d[k]
     return default
 
 def _yyyymmdd_from_iso(dt_iso: str) -> str:
-    """'2025-09-06T00:00:00-03:00' -> '06/09/2025' (dd/mm/aaaa)."""
+    """'2025-09-06T00:00:00-03:00' -> '06/09/2025'."""
     try:
         dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
         return dt.strftime("%d/%m/%Y")
     except Exception:
         return ""
 
-def _parse_emitida_em(dt_iso: Optional[str]):
-    if not dt_iso:
-        return None
+def _parse_emitida_em(dt_iso: str):
     try:
         return datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
     except Exception:
         return None
-
-def _extract_nfe_chave_from_payload(body: Dict[str, Any]) -> Optional[str]:
-    e = _event_block(body)
-    chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
-    if chave:
-        return str(chave)
-    # tenta extrair de URLs (44 dígitos)
-    for fld in ("nfe_xml", "nfe_danfe", "xml", "xml_base64", "danfe"):
-        v = _pick(e, fld) or _pick(body, fld)
-        if isinstance(v, str):
-            m = re.search(r"(\d{44})", v)
-            if m:
-                return m.group(1)
-    return None
 
 # ------------------------------------------------------------------------------
 # Omie API
@@ -197,7 +173,7 @@ async def _omie_call(session: aiohttp.ClientSession, endpoint: str, call: str, p
         "app_secret": OMIE_APP_SECRET,
         "param": [payload],
     }
-    async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
+    async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=OMIE_TIMEOUT)) as r:
         r.raise_for_status()
         data = await r.json()
         if isinstance(data, dict) and any(k in data for k in ("fault", "faultcode", "faultstring")):
@@ -209,41 +185,87 @@ async def _fetch_pedido_por_codigo(session: aiohttp.ClientSession, codigo_pedido
                             {"codigo_pedido": int(codigo_pedido)})
     return data.get("pedido_venda_produto") or data
 
-async def _fetch_xml_por_chave(session: aiohttp.ClientSession, nfe_chave: str, data_emis_iso: Optional[str]) -> Optional[str]:
+async def _fetch_xml_por_chave(session: aiohttp.ClientSession, nfe_chave: str, data_emis_iso: str | None) -> str | None:
     """
-    /api/v1/contador/xml/ -> ListarDocumentos: encontra pelo nChave e retorna cXml (sempre base64).
-    Se não houver data de emissão no evento, usa uma janela [agora - LOOKBACK ; agora + AHEAD].
+    /api/v1/contador/xml/ -> ListarDocumentos: encontra pelo nChave e retorna cXml (base64).
+    Tenta (1) dia exato, (2) janela lookback/lookahead e (3) sem datas.
     """
-    if data_emis_iso:
-        d_ini = d_fim = _yyyymmdd_from_iso(data_emis_iso)
-    else:
-        tz = ZoneInfo(TZ)
-        now_tz = datetime.now(tz)
-        d_ini = (now_tz - timedelta(days=NFE_LOOKBACK_DAYS)).strftime("%d/%m/%Y")
-        d_fim = (now_tz + timedelta(days=NFE_LOOKAHEAD_DAYS)).strftime("%d/%m/%Y")
+    async def _try(d_ini: str, d_fim: str) -> str | None:
+        payload = {
+            "nPagina": 1,
+            "nRegPorPagina": 200,
+            "cModelo": "55",
+            "dEmiInicial": d_ini,
+            "dEmiFinal": d_fim,
+        }
+        lista = await _omie_call(session, "contador/xml/", "ListarDocumentos", payload)
+        docs = (lista or {}).get("documentosEncontrados") or []
+        for doc in docs:
+            if str(doc.get("nChave")) == str(nfe_chave):
+                cxml = doc.get("cXml")
+                if not cxml:
+                    return None
+                if isinstance(cxml, str) and cxml.lstrip().startswith("<?xml"):
+                    return base64.b64encode(cxml.encode("utf-8")).decode("ascii")
+                return cxml
+        return None
 
-    payload = {
-        "nPagina": 1,
-        "nRegPorPagina": 200,
-        "cModelo": "55",
-        "dEmiInicial": d_ini or "",
-        "dEmiFinal": d_fim or "",
-    }
-    lista = await _omie_call(session, "contador/xml/", "ListarDocumentos", payload)
-    docs = (lista or {}).get("documentosEncontrados") or []
-    for doc in docs:
-        if str(doc.get("nChave")) == str(nfe_chave):
-            cxml = doc.get("cXml")
-            if not cxml:
-                return None
-            # se veio texto XML, codifica em base64
-            if isinstance(cxml, str) and cxml.lstrip().startswith("<?xml"):
-                return base64.b64encode(cxml.encode("utf-8")).decode("ascii")
-            return cxml
-    return None
+    # 1) dia exato se vier data
+    if data_emis_iso:
+        d = _yyyymmdd_from_iso(data_emis_iso)
+        if d:
+            b64 = await _try(d, d)
+            if b64:
+                return b64
+
+    # 2) janela (lookback/lookahead) baseada na data informada ou hoje
+    base_dt = _parse_emitida_em(data_emis_iso) if data_emis_iso else datetime.utcnow()
+    ini = (base_dt - timedelta(days=NFE_LOOKBACK_DAYS)).strftime("%d/%m/%Y")
+    fim = (base_dt + timedelta(days=NFE_LOOKAHEAD_DAYS)).strftime("%d/%m/%Y")
+    b64 = await _try(ini, fim)
+    if b64:
+        return b64
+
+    # 3) sem datas (últimos lotes permitidos pela Omie)
+    return await _try("", "")
+
+async def _xml_from_event_or_api(session: aiohttp.ClientSession, payload: dict, nfe_chave: str, data_emis_iso: str | None) -> str | None:
+    """
+    Preferir: xml_base64 direto -> texto XML -> URL (baixar) -> API ListarDocumentos.
+    """
+    e = _event_block(payload)
+
+    # a) já base64?
+    xml_b64 = _pick(e, "xml_base64")
+    if isinstance(xml_b64, str) and xml_b64.strip():
+        return xml_b64.strip()
+
+    # b) veio texto XML?
+    raw_xml = _pick(e, "xml") or _pick(e, "nfe_xml")  # às vezes o 'nfe_xml' pode ser XML
+    if isinstance(raw_xml, str) and raw_xml.lstrip().startswith("<?xml"):
+        return base64.b64encode(raw_xml.encode("utf-8")).decode("ascii")
+
+    # c) URL? (nfe_xml / danfe)
+    url = None
+    for fld in ("nfe_xml", "xml", "nfe_danfe"):
+        v = _pick(e, fld) or _pick(payload, fld)
+        if isinstance(v, str) and v.lower().startswith("http"):
+            url = v
+            break
+    if url:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=OMIE_TIMEOUT)) as r:
+                if r.status < 400:
+                    content = await r.read()
+                    return base64.b64encode(content).decode("ascii")
+        except Exception:
+            pass  # cai para a API
+
+    # d) fallback API
+    return await _fetch_xml_por_chave(session, nfe_chave, data_emis_iso)
 
 # ------------------------------------------------------------------------------
-# Rotas básicas
+# Health
 # ------------------------------------------------------------------------------
 @router.get("/healthz")
 async def healthz():
@@ -258,7 +280,6 @@ async def root():
 # ------------------------------------------------------------------------------
 @router.post("/omie/webhook")
 async def pedidos_webhook(request: Request, token: str = Query(...)):
-    """Recebe VendaProduto.* e guarda bruto na fila."""
     if token != TOKEN_PEDIDOS:
         raise HTTPException(status_code=404, detail="Not Found")
 
@@ -283,7 +304,6 @@ async def pedidos_webhook(request: Request, token: str = Query(...)):
 
 @router.post("/xml/omie/webhook")
 async def xml_webhook(request: Request, token: str = Query(...)):
-    """Recebe NFe.NotaAutorizada/Cancelada e guarda bruto na fila."""
     if token != TOKEN_XML:
         raise HTTPException(status_code=404, detail="Not Found")
 
@@ -316,10 +336,9 @@ async def run_jobs(secret: str = Query(...)):
 
     processed = 0
     errors = 0
-    log: List[Dict[str, Any]] = []
+    log: list[dict] = []
 
     async with app.state.pool.acquire() as conn, aiohttp.ClientSession() as session:
-        # ------------------------
         # 1) Pedidos
         rows = await conn.fetch("""
             SELECT id, payload
@@ -331,18 +350,15 @@ async def run_jobs(secret: str = Query(...)):
         """)
         for r in rows:
             try:
-                ev = r["payload"]
-                if isinstance(ev, str):
-                    try:
-                        ev = json.loads(ev)
-                    except Exception:
-                        ev = {}
-                ev = ev or {}
+                ev = r["payload"] or {}
                 e  = _event_block(ev)
-
                 codigo_pedido = (
-                    e.get("idPedido") or e.get("id_pedido") or e.get("codigo_pedido")
-                    or ev.get("idPedido") or ev.get("id_pedido") or ev.get("codigo_pedido")
+                    e.get("idPedido")
+                    or e.get("id_pedido")
+                    or e.get("codigo_pedido")
+                    or ev.get("idPedido")
+                    or ev.get("id_pedido")
+                    or ev.get("codigo_pedido")
                 )
                 if not codigo_pedido:
                     raise RuntimeError("evento sem idPedido/codigo_pedido")
@@ -384,7 +400,6 @@ async def run_jobs(secret: str = Query(...)):
 
                 processed += 1
                 log.append({"pedido_ok": id_pedido_omie})
-
             except Exception as ex:
                 errors += 1
                 log.append({"pedido_err": str(ex)})
@@ -394,7 +409,6 @@ async def run_jobs(secret: str = Query(...)):
                      WHERE id = $1;
                 """, r["id"], f"erro:{ex}")
 
-        # ------------------------
         # 2) NFe XML
         rows = await conn.fetch("""
             SELECT id, payload
@@ -406,29 +420,30 @@ async def run_jobs(secret: str = Query(...)):
         """)
         for r in rows:
             try:
-                ev = r["payload"]
-                if isinstance(ev, str):
-                    try:
-                        ev = json.loads(ev)
-                    except Exception:
-                        ev = {}
-                ev = ev or {}
+                ev = r["payload"] or {}
                 e  = _event_block(ev)
 
+                # chave por campos ou extraída de URLs (44 dígitos)
                 nfe_chave = _pick(e, "nfe_chave", "nChave", "chave_nfe", "chave")
                 if not nfe_chave:
-                    nfe_chave = _extract_nfe_chave_from_payload(ev)
+                    for fld in ("nfe_xml", "nfe_danfe", "xml", "xml_base64"):
+                        v = _pick(e, fld) or _pick(ev, fld)
+                        if isinstance(v, str):
+                            m = re.search(r"(\d{44})", v)
+                            if m:
+                                nfe_chave = m.group(1)
+                                break
                 if not nfe_chave:
                     raise RuntimeError("evento NFe sem chave")
 
                 data_emis  = _pick(e, "data_emis", "dEmissao")
                 numero_nf  = (_pick(e, "numero_nf", "nNumero") or "")
                 serie      = (_pick(e, "serie", "cSerie") or "")
-                emitida_em = _parse_emitida_em(data_emis)
+                emitida_em = _parse_emitida_em(data_emis) if data_emis else None
 
-                xml_b64 = await _fetch_xml_por_chave(session, str(nfe_chave), data_emis)
+                xml_b64 = await _xml_from_event_or_api(session, ev, str(nfe_chave), data_emis)
                 if not xml_b64:
-                    raise RuntimeError("XML não encontrado na API (ListarDocumentos)")
+                    raise RuntimeError("XML não encontrado (event + API)")
 
                 await conn.execute("""
                     INSERT INTO public.omie_nfe_xml
@@ -438,7 +453,6 @@ async def run_jobs(secret: str = Query(...)):
                     ON CONFLICT (chave_nfe) DO UPDATE
                       SET numero     = EXCLUDED.numero,
                           serie      = EXCLUDED.serie,
-                          emitida_em = EXCLUDED.emitida_em,
                           xml_base64 = EXCLUDED.xml_base64,
                           updated_at = now();
                 """, str(nfe_chave), str(numero_nf), str(serie), emitida_em, xml_b64)
@@ -451,7 +465,6 @@ async def run_jobs(secret: str = Query(...)):
 
                 processed += 1
                 log.append({"nfe_ok": str(nfe_chave)})
-
             except Exception as ex:
                 errors += 1
                 log.append({"nfe_err": str(ex)})
@@ -472,7 +485,8 @@ async def check_today(secret: str = Query(...)):
         raise HTTPException(status_code=401, detail="unauthorized")
     async with app.state.pool.acquire() as conn:
         webhooks_count = await conn.fetchval("""
-            SELECT COUNT(*) FROM public.omie_webhook_events
+            SELECT COUNT(*)
+              FROM public.omie_webhook_events
              WHERE (event_ts AT TIME ZONE 'America/Sao_Paulo')::date =
                    (now() AT TIME ZONE 'America/Sao_Paulo')::date;
         """)
