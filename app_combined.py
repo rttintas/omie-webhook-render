@@ -157,6 +157,11 @@ async def _insert_event(
     route: Optional[str],
     status_text: Optional[str],
 ) -> int:
+    """
+    Insere ou reaproveita o evento (idempotente).
+    - Se event_id for NULL: insere normal (UNIQUE permite vários NULLs).
+    - Se event_id existir: ON CONFLICT atualiza no-op e retorna o id da linha existente.
+    """
     row_id = await conn.fetchval(
         """
         INSERT INTO public.omie_webhook_events
@@ -166,11 +171,14 @@ async def _insert_event(
         VALUES ($1, $2, NOW(), $3, $4,
                 FALSE, NULL, NOW(),
                 $5, $6, $7, $8, $9)
+        ON CONFLICT (event_id)
+        DO UPDATE SET
+            event_id = EXCLUDED.event_id
         RETURNING id;
         """,
         source,
         event_type,
-        event_id,                 # None se faltar -> OK com índice parcial
+        event_id,
         payload,
         headers or {},
         int(http_status) if http_status is not None else None,
