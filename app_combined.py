@@ -1,7 +1,8 @@
-# app_combined.py — Pedidos + XML com fila de eventos (codec JSON, tópico PT/EN, evento)
+# app_combined.py — Pedidos + XML com fila de eventos (codec JSON, tópico PT/EN, evento, event_id robusto)
 
 import os
 import json
+import logging
 from typing import Any, Dict, Optional, List
 
 import asyncpg
@@ -9,7 +10,6 @@ import httpx
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-import logging
 
 # =========================================
 # Config
@@ -18,16 +18,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Faltou DATABASE_URL no ambiente")
 
-# Credenciais Omie
 OMIE_APP_KEY = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET", "")
 OMIE_TIMEOUT = float(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))
 
-# Tokens de webhook
 TOKEN_PEDIDOS = os.getenv("OMIE_WEBHOOK_TOKEN", "um-segredo-forte")
 TOKEN_XML = os.getenv("OMIE_WEBHOOK_TOKEN_XML") or os.getenv("OMIE_XML_TOKEN", "tiago-nati")
 
-# Segredo admin (para rotas /admin)
 ADMIN_SECRET = os.getenv("ADMIN_SECRET") or os.getenv("ADMIN_JOB_SECRET", "julia-matheus")
 
 app = FastAPI(title="RTT Omie - Combined (Pedidos + XML)")
@@ -36,7 +33,6 @@ app = FastAPI(title="RTT Omie - Combined (Pedidos + XML)")
 # Pool com codecs JSON
 # =========================================
 async def _setup_json_codecs(conn: asyncpg.Connection):
-    # Permite passar dict/list diretamente para colunas JSON/JSONB
     await conn.set_type_codec('json',  encoder=json.dumps, decoder=json.loads, schema='pg_catalog')
     await conn.set_type_codec('jsonb', encoder=json.dumps, decoder=json.loads, schema='pg_catalog')
 
@@ -46,7 +42,7 @@ async def create_pool() -> asyncpg.Pool:
         min_size=1,
         max_size=5,
         timeout=30,
-        init=_setup_json_codecs,  # <<< ESSENCIAL
+        init=_setup_json_codecs,
     )
 
 @asynccontextmanager
@@ -57,16 +53,13 @@ async def lifespan(app: FastAPI):
     yield
     await app.state.pool.close()
 
-app.router.lifespan_context = lifespan  # usa o lifespan acima
-
-async def get_pool() -> asyncpg.pool.Pool:
-    return app.state.pool
+app.router.lifespan_context = lifespan
+async def get_pool() -> asyncpg.pool.Pool: return app.state.pool
 
 # =========================================
 # Schema
 # =========================================
 async def ensure_schema(conn: asyncpg.Connection) -> None:
-    # Auditoria/fila de eventos
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
@@ -87,13 +80,11 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
         );
         """
     )
-    # Garante colunas novas se a tabela já existia
     for col, typ in (("topic", "TEXT"), ("route", "TEXT"), ("status", "TEXT")):
         await conn.execute(
             f'ALTER TABLE public.omie_webhook_events ADD COLUMN IF NOT EXISTS "{col}" {typ};'
         )
 
-    # Pedidos (exemplo simples; ajuste conforme seu modelo final)
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS public.omie_pedido (
@@ -106,7 +97,6 @@ async def ensure_schema(conn: asyncpg.Connection) -> None:
         """
     )
 
-    # XML de NFe (guardamos string de XML: pode ser URL ou base64) + payload
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
@@ -130,12 +120,27 @@ def _pick(d: Optional[Dict[str, Any]], *candidatos: str) -> Optional[Any]:
     return None
 
 def _topic_of(body: Dict[str, Any]) -> str:
-    # aceita topic, tópico, tipoEvento, tipo (no topo ou dentro de "evento")
     return (
         _pick(body, "topic", "tópico", "tipoEvento", "tipo")
         or _pick(body.get("evento", {}) or {}, "topic", "tópico", "tipoEvento", "tipo")
         or "desconhecido"
     )
+
+def _event_id_of(body: Dict[str, Any]) -> Optional[str]:
+    """
+    Define um ID único para o evento:
+      - preferir nfe_chave / idPedido (dentro de 'evento' quando existir)
+      - cair para nfe_chave no topo
+      - fallback: messageId (único da Omie)
+      - nunca retornar string vazia
+    """
+    evt = body.get("evento", {}) if isinstance(body.get("evento", {}), dict) else {}
+    ev_id = (
+        _pick(evt, "nfe_chave", "chave_nfe", "chave", "idPedido", "id_pedido", "codigo_pedido", "codigo")
+        or _pick(body, "nfe_chave", "chave_nfe", "chave")
+        or _pick(body, "messageId", "mensagemId", "message_id")
+    )
+    return str(ev_id) if ev_id not in (None, "", "NULL", "null") else None
 
 async def _insert_event(
     conn: asyncpg.Connection,
@@ -150,10 +155,6 @@ async def _insert_event(
     route: Optional[str],
     status_text: Optional[str],
 ) -> int:
-    """
-    Insere o evento; placeholders batem com as colunas.
-    Com os codecs registrados, payload e headers podem ser dict.
-    """
     row_id = await conn.fetchval(
         """
         INSERT INTO public.omie_webhook_events
@@ -167,9 +168,9 @@ async def _insert_event(
         """,
         source,
         event_type,
-        str(event_id) if event_id is not None else None,
-        payload,                 # dict -> jsonb (codec)
-        headers or {},           # dict -> jsonb (codec)
+        event_id,                 # None se faltar -> não conflita com índice parcial
+        payload,
+        headers or {},
         int(http_status) if http_status is not None else None,
         topic,
         route,
@@ -198,19 +199,11 @@ async def _upsert_pedido(
         int(id_pedido),
         numero,
         status,
-        detalhe,  # dict -> jsonb (codec)
+        detalhe,
     )
 
 async def _save_xml_payload(conn: asyncpg.Connection, payload: Dict[str, Any]) -> None:
-    """
-    Salva dados de NF-e.
-    O JSON real pode vir como:
-      { "evento": { "nfe_chave": "...", "nfe_xml": "<URL ou base64>", ... } }
-    ou top-level com os mesmos campos.
-    Gravamos a string de nfe_xml como veio (URL ou base64).
-    """
     base = payload.get("evento", {}) if isinstance(payload.get("evento", {}), dict) else payload
-
     chave = _pick(base, "nfe_chave", "chave_nfe", "chave")
     xml_value = _pick(base, "nfe_xml", "xml", "xml_base64")  # pode ser URL ou base64
     if not chave:
@@ -227,14 +220,13 @@ async def _save_xml_payload(conn: asyncpg.Connection, payload: Dict[str, Any]) -
         """,
         str(chave),
         str(xml_value) if xml_value is not None else None,
-        payload,  # dict -> jsonb (codec)
+        payload,
     )
 
 # =========================================
 # Omie – ConsultarPedido
 # =========================================
 async def omie_consultar_pedido(codigo_pedido: int) -> Dict[str, Any]:
-    """Chama ConsultarPedido na Omie e retorna dict com ok/erro sem levantar exceção."""
     if not OMIE_APP_KEY or not OMIE_APP_SECRET:
         return {"ok": False, "motivo": "sem_credencial"}
 
@@ -308,7 +300,6 @@ async def pedidos_webhook(
     headers = dict(request.headers)
     logging.info("Webhook recebido em %s: %s", request.url.path, body)
 
-    # Se vier dentro de "evento", vamos trabalhar sobre ele
     evt = body.get("evento", {}) if isinstance(body.get("evento", {}), dict) else {}
     topic = _topic_of(body)
 
@@ -317,8 +308,8 @@ async def pedidos_webhook(
             conn,
             source="omie",
             event_type="omie_webhook_received",
-            event_id=str(_pick(evt, "idPedido", "id_pedido", "codigo_pedido", "codigo") or ""),
-            payload=body,             # guarda o body inteiro no log
+            event_id=_event_id_of(body),   # <<< robusto
+            payload=body,
             headers=headers,
             http_status=200,
             topic=topic,
@@ -365,7 +356,6 @@ async def xml_webhook(
     headers = dict(request.headers)
     logging.info("Webhook recebido em %s: %s", request.url.path, body)
 
-    # Evento pode vir dentro de "evento" (padrão NF-e)
     evt = body.get("evento", {}) if isinstance(body.get("evento", {}), dict) else body
     topic = _topic_of(body)
 
@@ -374,8 +364,8 @@ async def xml_webhook(
             conn,
             source="omie",
             event_type="nfe_xml_received",
-            event_id=str(_pick(evt, "nfe_chave", "chave_nfe", "chave") or ""),
-            payload=body,             # guarda o body inteiro no log
+            event_id=_event_id_of(body),   # <<< robusto
+            payload=body,
             headers=headers,
             http_status=200,
             topic=topic,
@@ -383,7 +373,7 @@ async def xml_webhook(
             status_text="recebido",
         )
 
-        await _save_xml_payload(conn, body)  # passa body inteiro; a função decide onde ler
+        await _save_xml_payload(conn, body)
 
         await conn.execute(
             "UPDATE public.omie_webhook_events "
@@ -398,9 +388,7 @@ async def xml_webhook(
 # ADMIN – reprocessos
 # =========================================
 @app.api_route("/admin/run-jobs", methods=["GET", "POST"])
-async def admin_run_jobs(
-    secret: str = Query(...),
-):
+async def admin_run_jobs(secret: str = Query(...)):
     if secret != ADMIN_SECRET:
         raise HTTPException(status_code=404, detail="Not Found")
     summary = await run_jobs_once()
@@ -505,15 +493,8 @@ async def admin_reprocessar_xml(
 # Processador da fila (PEDIDOS)
 # =========================================
 async def run_jobs_once() -> Dict[str, Any]:
-    """
-    Processa eventos pendentes de PEDIDOS:
-      - lê omie_webhook_events
-      - consulta pedido na Omie
-      - atualiza omie_pedido
-    """
     pool = await get_pool()
-    processed = 0
-    errors = 0
+    processed, errors = 0, 0
     touched_ids: List[int] = []
 
     async with pool.acquire() as conn:
