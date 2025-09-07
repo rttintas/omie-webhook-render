@@ -1,5 +1,5 @@
 # app_combined.py
-# Serviço único FastAPI (webhooks + processamento)
+# Serviço único FastAPI (webhooks + processamento) com "auto-cicatrização" de colunas.
 # Rotas:
 # - GET  /healthz
 # - GET  /health
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
         command_timeout=60,
         max_inactive_connection_lifetime=300,
     )
-    # sanity check e criação de tabelas (não altera tipos existentes)
+    # sanity check e "auto-cicatrização" de schema
     async with app.state.pool.acquire() as conn:
         await conn.execute("SELECT 1;")
         await _ensure_tables(conn)
@@ -114,6 +114,7 @@ def _event_block(body: Dict[str, Any]) -> Dict[str, Any]:
     return body
 
 async def _ensure_tables(conn: asyncpg.Connection) -> None:
+    # Cria as tabelas se não existirem
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           bigserial PRIMARY KEY,
@@ -163,6 +164,44 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
         updated_at  timestamptz
     );
     """)
+
+    # ---- AUTO-CICATRIZAÇÃO: garante colunas exigidas pelo run-jobs mesmo se a tabela já existia ----
+    await conn.execute("""
+      ALTER TABLE public.omie_webhook_events
+        ADD COLUMN IF NOT EXISTS processed     boolean,
+        ADD COLUMN IF NOT EXISTS processed_at  timestamptz,
+        ADD COLUMN IF NOT EXISTS error         text,
+        ADD COLUMN IF NOT EXISTS received_at   timestamptz DEFAULT now();
+    """)
+
+    # (Opcional/Seguro) Só tenta ajustar tipos se NÃO forem jsonb; captura exceções silenciosamente
+    # Útil para ambientes antigos. Se houver views dependentes, o try/catch evita quebrar o startup.
+    try:
+        col = await conn.fetchval("""
+          SELECT data_type FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='omie_webhook_events' AND column_name='raw_headers'
+        """)
+        if col and col.lower() != 'jsonb':
+            await conn.execute("""
+              ALTER TABLE public.omie_webhook_events
+                ALTER COLUMN raw_headers TYPE jsonb USING (raw_headers::jsonb)
+            """)
+    except Exception:
+        pass
+
+    try:
+        col = await conn.fetchval("""
+          SELECT data_type FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='omie_webhook_events' AND column_name='payload'
+        """)
+        if col and col.lower() != 'jsonb':
+            await conn.execute("""
+              ALTER TABLE public.omie_webhook_events
+                ALTER COLUMN payload TYPE jsonb USING (payload::jsonb)
+            """)
+    except Exception:
+        pass
+    # -----------------------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
 # Health
@@ -401,7 +440,7 @@ async def run_jobs(secret: str = Query(...)):
                         except Exception:
                             qtd_itens = None
 
-                    # >>> PATCH AQUI: detalhe serializado + ::jsonb
+                    # detalhe serializado + ::jsonb (patch)
                     await conn.execute("""
                         INSERT INTO public.omie_pedido
                             (id_pedido_omie, numero, valor_total, situacao, quantidade_itens, cliente_codigo, detalhe, created_at, updated_at)
