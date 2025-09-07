@@ -199,24 +199,12 @@ async def healthz():
 # ------------------------------------------------------------------------------
 @router.post("/omie/webhook")
 async def pedidos_webhook(request: Request, token: str = Query(...)):
-    # DEBUG: Log headers e token para diagnóstico
-    headers = dict(request.headers)
-    logger.info(f"📨 Headers recebidos: {json.dumps(headers, indent=2)}")
-    logger.info(f"🔐 Token recebido via query: {token}")
-    logger.info(f"🔐 Token esperado (WEBHOOK_TOKEN_PED): {WEBHOOK_TOKEN_PED}")
-    
-    # Verificar se o token está vazio
-    if not WEBHOOK_TOKEN_PED:
-        logger.error("❌ WEBHOOK_TOKEN_PED não está configurado!")
-        raise HTTPException(status_code=500, detail="Token não configurado")
-    
     if token != WEBHOOK_TOKEN_PED:
-        logger.error(f"❌ Token inválido! Recebido: '{token}', Esperado: '{WEBHOOK_TOKEN_PED}'")
         raise HTTPException(status_code=403, detail="invalid token")
 
     try:
         body = await request.json()
-        logger.info(f"📥 Webhook pedido recebido: {json.dumps(body)[:500]}...")
+        logger.info(f"📥 Webhook pedido recebido")
     except Exception as e:
         logger.error(f"Erro ao ler JSON: {e}")
         body = {}
@@ -232,21 +220,12 @@ async def pedidos_webhook(request: Request, token: str = Query(...)):
 
 @router.post("/xml/omie/webhook")
 async def nfe_webhook(request: Request, token: str = Query(...)):
-    # DEBUG para XML também
-    logger.info(f"🔐 Token XML recebido: {token}")
-    logger.info(f"🔐 Token XML esperado: {WEBHOOK_TOKEN_XML}")
-    
-    if not WEBHOOK_TOKEN_XML:
-        logger.error("❌ WEBHOOK_TOKEN_XML não está configurado!")
-        raise HTTPException(status_code=500, detail="Token XML não configurado")
-    
     if token != WEBHOOK_TOKEN_XML:
-        logger.error(f"❌ Token XML inválido! Recebido: '{token}', Esperado: '{WEBHOOK_TOKEN_XML}'")
         raise HTTPException(status_code=403, detail="invalid token")
 
     try:
         body = await request.json()
-        logger.info(f"📥 Webhook NF-e recebido: {json.dumps(body)[:500]}...")
+        logger.info(f"📥 Webhook NF-e recebido")
     except Exception as e:
         logger.error(f"Erro ao ler JSON NF-e: {e}")
         body = {}
@@ -261,15 +240,15 @@ async def nfe_webhook(request: Request, token: str = Query(...)):
     return JSONResponse({"ok": True, "received": True})
 
 # ------------------------------------------------------------------------------
-# Processamento de NF-e (NOVO - CORREÇÃO CRÍTICA)
+# Processamento de NF-e (CORREÇÃO CRÍTICA - AJUSTADO)
 # ------------------------------------------------------------------------------
-async def processar_nfe(conn: asyncpg.Connection, ev: Dict[str, Any]) -> bool:
+async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bool:
     """
-    Processa uma NF-e e salva no banco de dados
+    Processa uma NF-e e salva no banco de dados - CORRIGIDO
     """
     try:
-        # Extrai campos da NF-e do evento
-        event_data = ev.get("event", {})
+        # Extrai campos da NF-e do payload
+        event_data = payload.get("event", {})
         chave = event_data.get("nfe_chave")
         numero = event_data.get("id_nf")
         data_emis = event_data.get("data_emis")
@@ -299,7 +278,7 @@ async def processar_nfe(conn: asyncpg.Connection, ev: Dict[str, Any]) -> bool:
             logger.error(f"❌ Erro ao baixar XML da NF-e {chave}: {e}")
             return False
         
-        # Salva no banco
+        # Salva no banco - CORREÇÃO: converter numero para string
         await conn.execute("""
             INSERT INTO public.omie_nfe_xml 
             (chave_nfe, numero, emitida_em, xml_base64, recebido_em, created_at, updated_at)
@@ -308,8 +287,8 @@ async def processar_nfe(conn: asyncpg.Connection, ev: Dict[str, Any]) -> bool:
             numero = EXCLUDED.numero,
             emitida_em = EXCLUDED.emitida_em,
             xml_base64 = EXCLUDED.xml_base64,
-            updated_at = NOW()
-        """, chave, numero, _parse_dt(data_emis), xml_base64)
+            updated_at = now()
+        """, chave, str(numero), _parse_dt(data_emis), xml_base64)  # ← str(numero) aqui!
         
         logger.info(f"✅ NF-e {chave} salva no banco")
         return True
@@ -321,29 +300,31 @@ async def processar_nfe(conn: asyncpg.Connection, ev: Dict[str, Any]) -> bool:
 # ------------------------------------------------------------------------------
 # Extração de campos (Pedido)
 # ------------------------------------------------------------------------------
-def _extract_pedido_id_from_event(ev: Dict[str, Any]) -> Optional[int]:
-    # Tenta várias chaves possíveis para o código do pedido
-    keys_to_try = [
-        "codigo_pedido", "codigo_pedido_omie", "idPedido", "id_pedido",
-        "pedido_id", "id_pedido_omie", "codigoPedido", "codigo_ped",
-        "nCodPed", "codigo", "idPedido"
-    ]
-    
-    # Primeiro tenta no nível raiz do evento
-    event_data = ev.get("event", {})
-    if not isinstance(event_data, dict):
-        event_data = ev
-    
-    for key in keys_to_try:
-        value = _pick(event_data, key)
-        if value:
-            try:
+def _extract_pedido_id_from_event(payload: Dict[str, Any]) -> Optional[int]:
+    """
+    Extrai o ID do pedido do payload - CORRIGIDO
+    """
+    try:
+        # O ID do pedido está em event->idPedido
+        event_data = payload.get("event", {})
+        id_pedido = event_data.get("idPedido")
+        
+        if id_pedido:
+            return int(id_pedido)
+        
+        # Tenta outras chaves possíveis
+        keys_to_try = ["codigo_pedido", "id_pedido", "pedido_id", "nCodPed"]
+        for key in keys_to_try:
+            value = event_data.get(key)
+            if value:
                 return int(value)
-            except (ValueError, TypeError):
-                continue
-    
-    logger.warning(f"❌ Não foi possível extrair código do pedido do evento: {json.dumps(ev)[:200]}...")
-    return None
+                
+        logger.warning(f"❌ Não foi possível extrair código do pedido")
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao extrair ID do pedido: {e}")
+        return None
 
 async def _consultar_pedido(client: httpx.AsyncClient, codigo_pedido: int) -> Dict[str, Any]:
     try:
@@ -375,7 +356,7 @@ async def run_jobs(secret: str = Query(...)):
                 FROM public.omie_webhook_events
                 WHERE processed = false
                 ORDER BY id ASC
-                LIMIT 100;
+                LIMit 100;
             """)
             
             logger.info(f"🔍 Encontrados {len(rows)} eventos para processar")
