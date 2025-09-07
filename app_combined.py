@@ -97,6 +97,7 @@ def _parse_dt(v: Any) -> Optional[datetime]:
         return None
     if isinstance(v, datetime):
         return v
+    # Omie manda "2025-09-06T00:00:00-03:00" etc.
     try:
         return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except Exception:
@@ -132,6 +133,7 @@ async def _omie_post(client: httpx.AsyncClient, url: str, call: str, payload: Di
 # DDL
 # ------------------------------------------------------------------------------
 async def _ensure_tables(conn: asyncpg.Connection) -> None:
+    # Log de eventos (genérico)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           bigserial PRIMARY KEY,
@@ -150,7 +152,8 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
         error        text
     );
     """)
-    
+
+    # Pedidos (enriquecidos)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_pedido (
         id_pedido_omie   bigint PRIMARY KEY,
@@ -164,7 +167,45 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
         updated_at       timestamptz
     );
     """)
-    
+
+    # NF-e "principal" — costuma existir no seu banco; cria só se não existir
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS public.omie_nfe (
+        chave_nfe        text PRIMARY KEY,
+        numero           text,
+        serie            text,
+        emitida_em       timestamptz,
+        cnpj_emitente    text,
+        cnpj_destinatario text,
+        valor_total      numeric(15,2),
+        status           text,
+        xml              text,
+        xml_url          text,
+        danfe_url        text,
+        last_event_at    timestamptz,
+        updated_at       timestamptz,
+        recebido_em      timestamptz DEFAULT now(),
+        raw              jsonb
+    );
+    """)
+    # Garante índice único na chave (caso a tabela exista sem PK)
+    await conn.execute("""
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE schemaname='public' AND indexname='idx_omie_nfe_chave_unique'
+      ) THEN
+        BEGIN
+          CREATE UNIQUE INDEX idx_omie_nfe_chave_unique ON public.omie_nfe (chave_nfe);
+        EXCEPTION WHEN duplicate_table THEN
+          -- ok
+        END;
+      END IF;
+    END$$;
+    """)
+
+    # Tabela auxiliar (opcional) para guardar XML em base64
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
         chave_nfe   text PRIMARY KEY,
@@ -204,7 +245,7 @@ async def pedidos_webhook(request: Request, token: str = Query(...)):
 
     try:
         body = await request.json()
-        logger.info(f"📥 Webhook pedido recebido")
+        logger.info("📥 Webhook pedido recebido")
     except Exception as e:
         logger.error(f"Erro ao ler JSON: {e}")
         body = {}
@@ -225,7 +266,7 @@ async def nfe_webhook(request: Request, token: str = Query(...)):
 
     try:
         body = await request.json()
-        logger.info(f"📥 Webhook NF-e recebido")
+        logger.info("📥 Webhook NF-e recebido")
     except Exception as e:
         logger.error(f"Erro ao ler JSON NF-e: {e}")
         body = {}
@@ -240,59 +281,99 @@ async def nfe_webhook(request: Request, token: str = Query(...)):
     return JSONResponse({"ok": True, "received": True})
 
 # ------------------------------------------------------------------------------
-# Processamento de NF-e (CORREÇÃO CRÍTICA - AJUSTADO)
+# Processamento de NF-e
 # ------------------------------------------------------------------------------
 async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bool:
     """
-    Processa uma NF-e e salva no banco de dados - CORRIGIDO
+    Processa uma NF-e e salva no banco de dados (tabela principal: public.omie_nfe)
     """
     try:
-        # Extrai campos da NF-e do payload
         event_data = payload.get("event", {})
-        chave = event_data.get("nfe_chave")
-        numero = event_data.get("id_nf")
-        data_emis = event_data.get("data_emis")
-        xml_url = event_data.get("nfe_xml")
-        
-        logger.info(f"🔍 Processando NF-e: Chave={chave}, Número={numero}")
-        
+        # campos padronizados do Omie em eventos de NF-e
+        chave = _safe_text(event_data.get("nfe_chave"))
+        numero_nfe = _safe_text(event_data.get("id_nf"))     # número interno do Omie
+        serie = _safe_text(event_data.get("serie"))
+        data_emis = _parse_dt(event_data.get("data_emis"))
+        xml_url = _safe_text(event_data.get("nfe_xml"))
+        danfe_url = _safe_text(event_data.get("nfe_danfe"))
+        cnpj_emit = _safe_text(event_data.get("empresa_cnpj"))
+        status = _safe_text(event_data.get("acao"))  # p.ex. "autorizada"
+
+        logger.info(f"🔍 Processando NF-e: Chave={chave}, Número={numero_nfe}")
+
         if not chave:
             logger.warning("❌ NF-e sem chave")
             return False
-        
         if not xml_url:
             logger.warning("❌ NF-e sem URL do XML")
             return False
-        
-        # Baixa o XML
+
+        # Baixa o XML (texto) e também guarda uma cópia base64 na tabela auxiliar
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(xml_url, timeout=30)
-                if response.status_code == 200:
-                    xml_base64 = base64.b64encode(response.content).decode('utf-8')
-                    logger.info(f"✅ XML baixado com sucesso para NF-e {chave}")
-                else:
-                    logger.error(f"❌ Erro ao baixar XML: {response.status_code}")
-                    return False
+                response.raise_for_status()
+                xml_text = response.text
+                xml_base64 = base64.b64encode(response.content).decode("utf-8")
+                logger.info(f"✅ XML baixado com sucesso para NF-e {chave}")
         except Exception as e:
             logger.error(f"❌ Erro ao baixar XML da NF-e {chave}: {e}")
             return False
-        
-        # Salva no banco - CORREÇÃO: converter numero para string
-        await conn.execute("""
-            INSERT INTO public.omie_nfe_xml 
-            (chave_nfe, numero, emitida_em, xml_base64, recebido_em, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, now(), now(), now())
+
+        # UPSERT na tabela principal public.omie_nfe (por chave_nfe)
+        await conn.execute(
+            """
+            INSERT INTO public.omie_nfe
+                (chave_nfe, numero, serie, emitida_em, cnpj_emitente, status, xml, xml_url, danfe_url, last_event_at, updated_at, recebido_em, raw)
+            VALUES
+                ($1,       $2,     $3,    $4,        $5,            $6,    $7,  $8,      $9,       now(),        now(),      now(),        $10)
             ON CONFLICT (chave_nfe) DO UPDATE SET
-            numero = EXCLUDED.numero,
-            emitida_em = EXCLUDED.emitida_em,
-            xml_base64 = EXCLUDED.xml_base64,
-            updated_at = now()
-        """, chave, str(numero), _parse_dt(data_emis), xml_base64)  # ← str(numero) aqui!
-        
-        logger.info(f"✅ NF-e {chave} salva no banco")
+                numero        = EXCLUDED.numero,
+                serie         = COALESCE(EXCLUDED.serie, public.omie_nfe.serie),
+                emitida_em    = COALESCE(EXCLUDED.emitida_em, public.omie_nfe.emitida_em),
+                cnpj_emitente = COALESCE(EXCLUDED.cnpj_emitente, public.omie_nfe.cnpj_emitente),
+                status        = COALESCE(EXCLUDED.status, public.omie_nfe.status),
+                xml           = EXCLUDED.xml,
+                xml_url       = EXCLUDED.xml_url,
+                danfe_url     = COALESCE(EXCLUDED.danfe_url, public.omie_nfe.danfe_url),
+                last_event_at = now(),
+                updated_at    = now(),
+                raw           = EXCLUDED.raw
+            """,
+            chave,
+            str(numero_nfe) if numero_nfe is not None else None,  # garante texto
+            serie,
+            data_emis,
+            cnpj_emit,
+            status,
+            xml_text,
+            xml_url,
+            danfe_url,
+            json.dumps(payload),
+        )
+
+        # Tabela auxiliar com XML em base64 (opcional)
+        await conn.execute(
+            """
+            INSERT INTO public.omie_nfe_xml (chave_nfe, numero, serie, emitida_em, xml_base64, recebido_em, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, now(), now(), now())
+            ON CONFLICT (chave_nfe) DO UPDATE SET
+                numero     = EXCLUDED.numero,
+                serie      = COALESCE(EXCLUDED.serie, public.omie_nfe_xml.serie),
+                emitida_em = COALESCE(EXCLUDED.emitida_em, public.omie_nfe_xml.emitida_em),
+                xml_base64 = EXCLUDED.xml_base64,
+                updated_at = now()
+            """,
+            chave,
+            str(numero_nfe) if numero_nfe is not None else None,
+            serie,
+            data_emis,
+            xml_base64,
+        )
+
+        logger.info(f"✅ NF-e {chave} salva no banco (omie_nfe)")
         return True
-        
+
     except Exception as e:
         logger.error(f"❌ Erro ao processar NF-e: {e}")
         return False
@@ -302,26 +383,23 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bo
 # ------------------------------------------------------------------------------
 def _extract_pedido_id_from_event(payload: Dict[str, Any]) -> Optional[int]:
     """
-    Extrai o ID do pedido do payload - CORRIGIDO
+    Extrai o ID do pedido do payload.
     """
     try:
-        # O ID do pedido está em event->idPedido
         event_data = payload.get("event", {})
         id_pedido = event_data.get("idPedido")
-        
         if id_pedido:
             return int(id_pedido)
-        
-        # Tenta outras chaves possíveis
+
         keys_to_try = ["codigo_pedido", "id_pedido", "pedido_id", "nCodPed"]
         for key in keys_to_try:
             value = event_data.get(key)
             if value:
                 return int(value)
-                
-        logger.warning(f"❌ Não foi possível extrair código do pedido")
+
+        logger.warning("❌ Não foi possível extrair código do pedido")
         return None
-        
+
     except Exception as e:
         logger.error(f"❌ Erro ao extrair ID do pedido: {e}")
         return None
@@ -337,7 +415,7 @@ async def _consultar_pedido(client: httpx.AsyncClient, codigo_pedido: int) -> Di
         raise
 
 # ------------------------------------------------------------------------------
-# Run Jobs (cron) - CORRIGIDO
+# Run Jobs (cron)
 # ------------------------------------------------------------------------------
 @router.post("/admin/run-jobs")
 async def run_jobs(secret: str = Query(...)):
@@ -350,17 +428,18 @@ async def run_jobs(secret: str = Query(...)):
 
     try:
         async with app.state.pool.acquire() as conn:
-            # Buscar eventos não processados
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT id, route, payload
                 FROM public.omie_webhook_events
                 WHERE processed = false
                 ORDER BY id ASC
-                LIMit 100;
-            """)
-            
+                LIMIT 100
+                """
+            )
+
             logger.info(f"🔍 Encontrados {len(rows)} eventos para processar")
-            
+
             if not rows:
                 return JSONResponse({"ok": True, "processed": 0, "message": "Nenhum evento pendente"})
 
@@ -369,11 +448,11 @@ async def run_jobs(secret: str = Query(...)):
                     ev_id = r["id"]
                     route = r["route"] or ""
                     payload = _as_json(r["payload"])
-                    
+
                     try:
                         logger.info(f"⚡ Processando evento {ev_id} da rota {route}")
-                        
-                        # Processar NF-e
+
+                        # NF-e
                         if "/xml/omie/webhook" in route:
                             logger.info(f"📄 Processando NF-e do evento {ev_id}")
                             success = await processar_nfe(conn, payload)
@@ -385,81 +464,83 @@ async def run_jobs(secret: str = Query(...)):
                                 errors += 1
                                 log.append({"nfe_error": ev_id})
                             continue
-                            
-                        # Processar pedidos
+
+                        # Pedidos
                         if "/omie/webhook" in route:
                             codigo_pedido = _extract_pedido_id_from_event(payload)
-                            
+
                             if not codigo_pedido:
                                 logger.warning(f"⚠️  Evento {ev_id} sem código de pedido válido")
                                 await conn.execute("UPDATE public.omie_webhook_events SET processed=true, processed_at=now() WHERE id=$1", ev_id)
                                 processed += 1
                                 log.append({"pedido_skip_sem_codigo": ev_id})
                                 continue
-                            
+
                             logger.info(f"📦 Processando pedido {codigo_pedido}")
-                            
+
                             if ENRICH_PEDIDO_IMEDIATO:
                                 try:
                                     pedido_data = await _consultar_pedido(client, codigo_pedido)
                                     pedido_venda = pedido_data.get("pedido_venda_produto", {})
                                     cabecalho = pedido_venda.get("cabecalho", {})
-                                    
+
                                     numero = _safe_text(_pick(cabecalho, "numero_pedido", "numero"))
-                                    valor_total = _pick(cabecalho, "valor_total", "valor_mercadoria")
+                                    valor_total = _pick(cabecalho, "valor_total", "valor_mercadorias")
                                     situacao = _safe_text(_pick(cabecalho, "etapa", "situacao"))
                                     cliente_codigo = _safe_text(_pick(cabecalho, "codigo_cliente"))
-                                    
+
                                     detalhes = pedido_venda.get("det", [])
                                     quantidade_itens = len(detalhes) if isinstance(detalhes, list) else 0
-                                    
-                                    await conn.execute("""
+
+                                    await conn.execute(
+                                        """
                                         INSERT INTO public.omie_pedido 
-                                        (id_pedido_omie, numero, valor_total, situacao, quantidade_itens, cliente_codigo, detalhe, created_at, updated_at)
+                                            (id_pedido_omie, numero, valor_total, situacao, quantidade_itens, cliente_codigo, detalhe, created_at, updated_at)
                                         VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
                                         ON CONFLICT (id_pedido_omie) DO UPDATE SET
-                                        numero = COALESCE(EXCLUDED.numero, omie_pedido.numero),
-                                        valor_total = COALESCE(EXCLUDED.valor_total, omie_pedido.valor_total),
-                                        situacao = COALESCE(EXCLUDED.situacao, omie_pedido.situacao),
-                                        quantidade_itens = COALESCE(EXCLUDED.quantidade_itens, omie_pedido.quantidade_itens),
-                                        cliente_codigo = COALESCE(EXCLUDED.cliente_codigo, omie_pedido.cliente_codigo),
-                                        detalhe = COALESCE(EXCLUDED.detalhe, omie_pedido.detalhe),
-                                        updated_at = now();
-                                    """, codigo_pedido, numero, valor_total, situacao, quantidade_itens, cliente_codigo, json.dumps(pedido_venda))
-                                    
+                                            numero = COALESCE(EXCLUDED.numero, omie_pedido.numero),
+                                            valor_total = COALESCE(EXCLUDED.valor_total, omie_pedido.valor_total),
+                                            situacao = COALESCE(EXCLUDED.situacao, omie_pedido.situacao),
+                                            quantidade_itens = COALESCE(EXCLUDED.quantidade_itens, omie_pedido.quantidade_itens),
+                                            cliente_codigo = COALESCE(EXCLUDED.cliente_codigo, omie_pedido.cliente_codigo),
+                                            detalhe = COALESCE(EXCLUDED.detalhe, omie_pedido.detalhe),
+                                            updated_at = now()
+                                        """,
+                                        codigo_pedido, numero, valor_total, situacao,
+                                        quantidade_itens, cliente_codigo, json.dumps(pedido_venda)
+                                    )
+
                                     logger.info(f"✅ Pedido {codigo_pedido} salvo no banco")
-                                    
+
                                 except Exception as e:
                                     logger.error(f"❌ Erro ao enriquecer pedido {codigo_pedido}: {e}")
-                                    # Continua mesmo com erro no enriquecimento
-                            
+
                             await conn.execute("UPDATE public.omie_webhook_events SET processed=true, processed_at=now() WHERE id=$1", ev_id)
                             processed += 1
                             log.append({"pedido_ok": codigo_pedido, "event_id": ev_id})
-                            
+
                         else:
-                            # Marcar outros tipos de evento como processados
                             await conn.execute("UPDATE public.omie_webhook_events SET processed=true, processed_at=now() WHERE id=$1", ev_id)
                             processed += 1
                             log.append({"evento_processado": ev_id, "rota": route})
-                            
+
                     except Exception as e:
                         errors += 1
                         error_msg = f"{type(e).__name__}: {str(e)}"
                         await conn.execute("UPDATE public.omie_webhook_events SET error=$1 WHERE id=$2", error_msg, ev_id)
                         logger.error(f"❌ Erro processando evento {ev_id}: {error_msg}")
                         log.append({"erro": error_msg, "event_id": ev_id})
-            
+
             logger.info(f"✅ Processamento concluído: {processed} processados, {errors} erros")
-            
+
     except Exception as e:
         logger.error(f"❌ Erro geral no run-jobs: {e}")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    
+
     return JSONResponse({
-        "ok": True, 
-        "processed": processed, 
-        "errors": errors, 
+        "ok": True,
+        "processed": processed,
+        "errors": errors,
         "events": log,
         "message": f"Processados: {processed}, Erros: {errors}"
     })
@@ -471,7 +552,7 @@ async def run_jobs(secret: str = Query(...)):
 async def debug_events(secret: str = Query(...)):
     if secret != ADMIN_RUNJOBS_SECRET:
         raise HTTPException(status_code=403, detail="invalid secret")
-    
+
     async with app.state.pool.acquire() as conn:
         events = await conn.fetch("""
             SELECT id, route, processed, error, received_at, payload::text as payload_text
@@ -479,21 +560,20 @@ async def debug_events(secret: str = Query(...)):
             ORDER BY id DESC 
             LIMIT 20
         """)
-        
         pedidos = await conn.fetch("SELECT * FROM public.omie_pedido ORDER BY created_at DESC LIMIT 10")
-        nfes = await conn.fetch("SELECT * FROM public.omie_nfe_xml ORDER BY created_at DESC LIMIT 10")
-    
+        nfes = await conn.fetch("SELECT * FROM public.omie_nfe ORDER BY recebido_em DESC LIMIT 10")
+
     return JSONResponse({
         "events": [dict(e) for e in events],
         "pedidos": [dict(p) for p in pedidos],
-        "nfes": [dict(n) for n in nfes]
+        "nfes": [dict(n) for n in nfes],
     })
 
 @router.get("/admin/debug/tokens")
 async def debug_tokens(secret: str = Query(...)):
     if secret != ADMIN_RUNJOBS_SECRET:
         raise HTTPException(status_code=403, detail="invalid secret")
-    
+
     return JSONResponse({
         "WEBHOOK_TOKEN_PED": WEBHOOK_TOKEN_PED,
         "WEBHOOK_TOKEN_XML": WEBHOOK_TOKEN_XML,
