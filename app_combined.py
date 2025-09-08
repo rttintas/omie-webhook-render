@@ -210,7 +210,7 @@ async def healthz():
     try:
         async with app.state.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT now() AS now, count(*) AS pend FROM public.omie_webhook_events WHERE processed=false")
-            return {"ok": True, "now": str(row["now"]), "pending_events": row["pend"]}
+            return {"ok": True, "now": str(row["now"], "pending_events": row["pend"]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -264,14 +264,13 @@ async def _buscar_links_xml_via_api(client: httpx.AsyncClient, chave: str, data_
     """
     dEmiInicial, dEmiFinal = _date_range_for_omie(data_emis)
     
+    # PAYLOAD CORRETO - sem parâmetros não suportados
     payload = {
         "nPagina": 1,
         "nRegPorPagina": 100,
         "cModelo": "55",
         "dEmiInicial": dEmiInicial,
-        "dEmiFinal": dEmiFinal,
-        "cOrdenarPor": "DHEMIT",
-        "cOrdemDecrescente": "N"
+        "dEmiFinal": dEmiFinal
     }
     
     try:
