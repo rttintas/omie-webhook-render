@@ -4,6 +4,9 @@ import os
 import json
 import logging
 import base64
+import asyncio
+import time
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -38,6 +41,10 @@ OMIE_XML_LIST_CALL = "ListarDocumentos"
 ENRICH_PEDIDO_IMEDIATO = True
 NFE_LOOKBACK_DAYS = 7
 NFE_LOOKAHEAD_DAYS = 1
+
+# Rate limiting
+OMIE_RATE_LIMIT_DELAY = 3.0  # segundos entre requisições
+LAST_API_CALL_TIME = 0
 
 # ------------------------------------------------------------------------------
 # App
@@ -101,39 +108,86 @@ def _date_range_for_omie(data_emis: Optional[datetime]) -> Tuple[str, str]:
 def _build_omie_body(call: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"call": call, "app_key": OMIE_APP_KEY, "app_secret": OMIE_APP_SECRET, "param": [payload]}
 
-async def _omie_post(client: httpx.AsyncClient, url: str, call: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    body = _build_omie_body(call, payload)
-    try:
-        logger.info(f"📤 Request to {url}: {json.dumps(body, ensure_ascii=False)}")
-        
-        res = await client.post(url, json=body, timeout=OMIE_TIMEOUT_SECONDS)
-        
-        logger.info(f"📥 Response status: {res.status_code}")
-        logger.info(f"📥 Response text: {res.text}")
-        
-        res.raise_for_status()
-        j = res.json()
-        
-        if isinstance(j, dict) and j.get("faultstring"):
-            error_msg = f"Omie error: {j.get('faultstring')}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+def _extract_retry_time(error_message: str) -> int:
+    """Extrai o tempo de espera da mensagem de erro da Omie"""
+    match = re.search(r"em (\d+) segundos", error_message)
+    if match:
+        return int(match.group(1))
+    return 120  # Fallback: 2 minutos
+
+async def _omie_post_with_retry(client: httpx.AsyncClient, url: str, call: str, payload: Dict[str, Any], max_retries: int = 2) -> Dict[str, Any]:
+    """
+    Faz requisições para API Omie com rate limiting inteligente
+    """
+    global LAST_API_CALL_TIME
+    
+    for attempt in range(max_retries):
+        try:
+            # Rate limiting - espera entre requisições
+            current_time = time.time()
+            elapsed = current_time - LAST_API_CALL_TIME
+            if elapsed < OMIE_RATE_LIMIT_DELAY:
+                wait_time = OMIE_RATE_LIMIT_DELAY - elapsed
+                await asyncio.sleep(wait_time)
             
-        return j
-        
-    except httpx.HTTPStatusError as e:
-        error_detail = f"HTTP error {e.response.status_code}: {e.response.text}"
-        logger.error(f"❌ HTTP error details: {error_detail}")
-        raise
-    except Exception as e:
-        logger.error(f"❌ Unexpected error in _omie_post: {e}")
-        raise
+            LAST_API_CALL_TIME = time.time()
+            
+            body = _build_omie_body(call, payload)
+            logger.info(f"📤 Request to {url} (attempt {attempt + 1}/{max_retries})")
+            
+            res = await client.post(url, json=body, timeout=OMIE_TIMEOUT_SECONDS)
+            
+            logger.info(f"📥 Response status: {res.status_code}")
+            
+            # Trata erro 425 (consumo indevido)
+            if res.status_code == 425:
+                error_data = res.json()
+                retry_after = _extract_retry_time(error_data.get("faultstring", ""))
+                
+                logger.warning(f"⏳ API bloqueada. Retentando em {retry_after} segundos...")
+                await asyncio.sleep(retry_after)
+                continue
+                
+            res.raise_for_status()
+            return res.json()
+            
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 425 and attempt < max_retries - 1:
+                error_data = e.response.json()
+                retry_after = _extract_retry_time(error_data.get("faultstring", ""))
+                
+                logger.warning(f"⏳ API bloqueada (425). Tentativa {attempt + 1}/{max_retries}")
+                await asyncio.sleep(retry_after)
+                continue
+            else:
+                error_detail = f"HTTP error {e.response.status_code}: {e.response.text}"
+                logger.error(f"❌ HTTP error details: {error_detail}")
+                raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"⚠️ Erro na tentativa {attempt + 1}: {e}")
+                await asyncio.sleep(10 * (attempt + 1))  # Backoff
+                continue
+            else:
+                logger.error(f"❌ Unexpected error in _omie_post: {e}")
+                raise
+    
+    raise Exception("Todas as tentativas falharam")
 
 def _pick(d: Dict[str, Any], *keys: str) -> Optional[Any]:
     if not isinstance(d, dict): return None
     for k in keys:
         if k in d and d[k] not in (None, ""):
             return d[k]
+    return None
+
+def _get_value(doc, *possible_keys):
+    """Função auxiliar para extrair valores com chaves alternativas"""
+    if not isinstance(doc, dict):
+        return None
+    for key in possible_keys:
+        if key in doc and doc[key] not in (None, "", 0):
+            return str(doc[key]).strip()
     return None
 
 # ------------------------------------------------------------------------------
@@ -262,8 +316,7 @@ async def nfe_webhook(request: Request, token: str = Query(...)):
 # ------------------------------------------------------------------------------
 async def _buscar_links_xml_via_api(client: httpx.AsyncClient, chave: str, data_emis: Optional[datetime]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Consulta avançada na API Contador/XML com paginação múltipla
-    e busca inteligente pela chave da NF-e
+    Consulta a API Contador/XML → ListarDocumentos para encontrar UMA NF-e específica
     """
     # Extrai data da chave se não for fornecida
     if not data_emis and chave and len(chave) >= 6:
@@ -279,78 +332,66 @@ async def _buscar_links_xml_via_api(client: httpx.AsyncClient, chave: str, data_
     
     logger.info(f"🔍 Buscando NF-e {chave} no período {dEmiInicial} a {dEmiFinal}")
     
-    # Busca em múltiplas páginas
-    for pagina in range(1, 6):  # Até 5 páginas
-        payload = {
-            "nPagina": pagina,
-            "nRegPorPagina": 100,
-            "cModelo": "55",
-            "dEmiInicial": dEmiInicial,
-            "dEmiFinal": dEmiFinal
-        }
-        
-        try:
-            logger.info(f"📄 Consultando página {pagina}...")
-            resp = await _omie_post(client, OMIE_XML_URL, OMIE_XML_LIST_CALL, payload)
-            
-            # Procura em todas as listas possíveis da resposta
-            documentos = []
-            if isinstance(resp, dict):
-                for key, value in resp.items():
-                    if isinstance(value, list):
-                        documentos.extend(value)
-                        logger.info(f"📋 Encontrados {len(value)} documentos em '{key}'")
-            
-            # Busca inteligente pela chave
-            for doc in documentos:
-                if not isinstance(doc, dict):
-                    continue
-                
-                # Verifica todos os campos possíveis que podem conter a chave
-                chave_encontrada = None
-                for campo in ["chave", "chaveNFe", "nfe_chave", "cChaveNFe", "nChave"]:
-                    if campo in doc and doc[campo]:
-                        chave_candidate = str(doc[campo]).strip()
-                        if chave_candidate == chave:
-                            chave_encontrada = chave_candidate
-                            break
-                
-                if chave_encontrada:
-                    # Encontrou a NF-e, agora busca os URLs
-                    xml_url = None
-                    danfe_url = None
-                    
-                    for campo_xml in ["xml_url", "url_xml", "nfe_xml", "link_xml"]:
-                        if campo_xml in doc and doc[campo_xml]:
-                            xml_url = str(doc[campo_xml])
-                            break
-                    
-                    for campo_danfe in ["danfe_url", "url_danfe", "nfe_danfe", "link_danfe"]:
-                        if campo_danfe in doc and doc[campo_danfe]:
-                            danfe_url = str(doc[campo_danfe])
-                            break
-                    
-                    if xml_url:
-                        logger.info(f"✅ NF-e {chave} encontrada na página {pagina}")
-                        return xml_url, danfe_url
-            
-            # Verifica se há mais páginas
-            total_reg = None
-            for campo_total in ["nTotRegistros", "total_registros", "nTotalRegistros"]:
-                if campo_total in resp and resp[campo_total]:
-                    total_reg = int(resp[campo_total])
-                    break
-            
-            if total_reg and pagina * 100 >= total_reg:
-                logger.info(f"ℹ️ Última página atingida. Total de registros: {total_reg}")
-                break
-                
-        except Exception as e:
-            logger.error(f"❌ Erro na página {pagina}: {e}")
-            continue
+    # PAYLOAD simplificado
+    payload = {
+        "nPagina": 1,
+        "nRegPorPagina": 50,
+        "cModelo": "55",
+        "dEmiInicial": dEmiInicial,
+        "dEmiFinal": dEmiFinal
+    }
     
-    logger.warning(f"⚠️ NF-e {chave} não encontrada após {pagina} páginas")
-    return None, None
+    try:
+        logger.info(f"📄 Consultando API Omie...")
+        resp = await _omie_post_with_retry(client, OMIE_XML_URL, OMIE_XML_LIST_CALL, payload)
+        
+        # Procura em todas as listas possíveis da resposta
+        documentos = []
+        if isinstance(resp, dict):
+            for key, value in resp.items():
+                if isinstance(value, list):
+                    documentos.extend(value)
+                    logger.info(f"📋 Encontrados {len(value)} documentos em '{key}'")
+        
+        # Busca inteligente pela chave
+        for doc in documentos:
+            if not isinstance(doc, dict):
+                continue
+            
+            # Verifica todos os campos possíveis que podem conter a chave
+            chave_encontrada = None
+            for campo in ["chave", "chaveNFe", "nfe_chave", "cChaveNFe", "nChave"]:
+                if campo in doc and doc[campo]:
+                    chave_candidate = str(doc[campo]).strip()
+                    if chave_candidate == chave:
+                        chave_encontrada = chave_candidate
+                        break
+            
+            if chave_encontrada:
+                # Encontrou a NF-e, agora busca os URLs
+                xml_url = None
+                danfe_url = None
+                
+                for campo_xml in ["xml_url", "url_xml", "nfe_xml", "link_xml"]:
+                    if campo_xml in doc and doc[campo_xml]:
+                        xml_url = str(doc[campo_xml])
+                        break
+                
+                for campo_danfe in ["danfe_url", "url_danfe", "nfe_danfe", "link_danfe"]:
+                    if campo_danfe in doc and doc[campo_danfe]:
+                        danfe_url = str(doc[campo_danfe])
+                        break
+                
+                if xml_url:
+                    logger.info(f"✅ NF-e {chave} encontrada!")
+                    return xml_url, danfe_url
+        
+        logger.warning(f"⚠️ NF-e {chave} não encontrada na resposta da API")
+        return None, None
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao consultar API Omie: {e}")
+        return None, None
 
 async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], client: httpx.AsyncClient) -> bool:
     """
@@ -389,10 +430,10 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
             r = await client.get(xml_url, timeout=OMIE_TIMEOUT_SECONDS)
             r.raise_for_status()
             
-            # Limpeza básica do XML (remove caracteres problemáticos)
+            # Limpeza básica do XML
             xml_text = r.text
             xml_text = xml_text.replace('\r', '').replace('\n', ' ').strip()
-            xml_text = ' '.join(xml_text.split())  # Remove espaços múltiplos
+            xml_text = ' '.join(xml_text.split())
             
             xml_base64 = base64.b64encode(r.content).decode("utf-8")
             logger.info(f"✅ XML baixado e limpo para NF-e {chave}")
@@ -453,7 +494,7 @@ def _extract_pedido_id_from_event(payload: Dict[str, Any]) -> Optional[int]:
 
 async def _consultar_pedido(client: httpx.AsyncClient, codigo_pedido: int) -> Dict[str, Any]:
     payload = {"codigo_pedido": codigo_pedido}
-    return await _omie_post(client, OMIE_PEDIDO_URL, "ConsultarPedido", payload)
+    return await _omie_post_with_retry(client, OMIE_PEDIDO_URL, "ConsultarPedido", payload)
 
 # ------------------------------------------------------------------------------
 # Run Jobs
@@ -597,24 +638,6 @@ async def debug_tokens(secret: str = Query(...)):
         "OMIE_APP_SECRET": "CONFIGURADO" if OMIE_APP_SECRET else "NÃO CONFIGURADO",
         "DATABASE_URL": "CONFIGURADO" if DATABASE_URL else "NÃO CONFIGURADO"
     })
-
-@router.get("/admin/debug/nfe/{chave}")
-async def debug_nfe(chave: str, secret: str = Query(...)):
-    if secret != ADMIN_RUNJOBS_SECRET:
-        raise HTTPException(status_code=403, detail="invalid secret")
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            xml_url, danfe_url = await _buscar_links_xml_via_api(client, chave, None)
-            
-            return {
-                "chave": chave,
-                "xml_url": xml_url,
-                "danfe_url": danfe_url,
-                "status": "found" if xml_url else "not_found"
-            }
-    except Exception as e:
-        return {"error": str(e), "status": "error"}
 
 # ------------------------------------------------------------------------------
 # Mount
