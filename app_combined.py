@@ -210,7 +210,7 @@ async def healthz():
     try:
         async with app.state.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT now() AS now, count(*) AS pend FROM public.omie_webhook_events WHERE processed=false")
-            return {"ok": True, "now": str(row["now"], "pending_events": row["pend"]}
+            return {"ok": True, "now": str(row["now"]), "pending_events": row["pend"]}  # ✅ Correto
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
