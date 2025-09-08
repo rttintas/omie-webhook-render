@@ -7,70 +7,46 @@ from typing import Any, Dict, Optional, Tuple
 import asyncpg
 import httpx
 
-# --- 1. Configurações e Constantes (ajuste com seus valores) ---
-
-# Configure o logger conforme seu ambiente
+# --- 1. Configurações e Constantes ---
 logger = logging.getLogger("app_combined")
-
-# Suas constantes da Omie (substitua pelos valores reais)
 OMIE_XML_URL = "https://app.omie.com.br/api/v1/contador/xml/"
 OMIE_XML_LIST_CALL = "ListarDocumentos"
 OMIE_TIMEOUT_SECONDS = 30.0
 
-
-# --- 2. Funções Auxiliares (substitua com suas implementações reais) ---
+# --- 2. Funções Auxiliares ---
 
 async def _omie_post(client: httpx.AsyncClient, url: str, call: str, payload: Dict) -> Dict:
-    # Esta função deve encapsular sua lógica de chamada à API Omie,
-    # incluindo app_key e app_secret.
-    # Exemplo:
-    # app_key = "SEU_APP_KEY"
-    # app_secret = "SEU_APP_SECRET"
-    # request_data = {"call": call, "param": [payload], "app_key": app_key, "app_secret": app_secret}
-    # response = await client.post(url, json=request_data, timeout=OMIE_TIMEOUT_SECONDS)
-    # response.raise_for_status()
-    # return response.json()
+    # Substitua pela sua implementação real, com app_key e app_secret
     logger.info(f"Simulando _omie_post para call: {call} com payload: {payload}")
-    # Retorno simulado para fins de exemplo
     return {"nTotPáginas": 0, "documentos": []}
 
 def _pick(data: Dict, *keys: str) -> Any:
-    """Retorna o primeiro valor não nulo para uma lista de chaves."""
     for key in keys:
         if key in data and data[key]:
             return data[key]
     return None
 
 def _safe_text(value: Any) -> Optional[str]:
-    """Converte um valor para string de forma segura."""
     return str(value).strip() if value is not None else None
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    """Converte uma string de data para um objeto datetime."""
     if not value:
         return None
     try:
-        # Tenta formatos comuns
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
 
 def _date_range_for_omie(dt: Optional[datetime]) -> Tuple[str, str]:
-    """Cria um intervalo de datas no formato D/M/AAAA para a API Omie."""
     if not dt:
         dt = datetime.now()
-    # Exemplo simples: pega o primeiro e último dia do mês
     first_day = dt.replace(day=1)
     last_day = (first_day.replace(month=first_day.month % 12 + 1, day=1) - timedelta(days=1))
     return first_day.strftime("%d/%m/%Y"), last_day.strftime("%d/%m/%Y")
 
-
 # --- 3. Lógica Principal Corrigida ---
 
 async def _buscar_conteudo_xml_via_api(client: httpx.AsyncClient, chave: str, data_emis: Optional[datetime]) -> Optional[str]:
-    """
-    Consulta a API Contador/XML -> ListarDocumentos e retorna o CONTEÚDO do XML da NF-e específica.
-    """
     if not data_emis and chave and len(chave) >= 4:
         try:
             ano = int(chave[2:4])
@@ -84,7 +60,7 @@ async def _buscar_conteudo_xml_via_api(client: httpx.AsyncClient, chave: str, da
     pagina = 1
     registros_por_pagina = 50
     
-    while pagina <= 10:  # Limite de 10 páginas para evitar loop infinito
+    while pagina <= 10:
         payload = {
             "nPagina": pagina,
             "nRegPorPagina": registros_por_pagina,
@@ -110,7 +86,6 @@ async def _buscar_conteudo_xml_via_api(client: httpx.AsyncClient, chave: str, da
                 
                 if chave_doc and chave_doc == chave:
                     xml_content = _get_api_value(documento, "cXml")
-                    
                     if xml_content:
                         logger.info(f"✅ XML da NF-e {chave} encontrado diretamente na resposta da API (Página {pagina}).")
                         return xml_content
@@ -130,10 +105,6 @@ async def _buscar_conteudo_xml_via_api(client: httpx.AsyncClient, chave: str, da
     return None
 
 async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], client: httpx.AsyncClient) -> bool:
-    """
-    Processa uma NF-e específica com tratamento robusto para obter o XML,
-    seja por URL (webhook) ou por conteúdo direto (API).
-    """
     try:
         event = payload.get("event", {}) or {}
         
