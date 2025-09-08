@@ -1,7 +1,7 @@
 import base64
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta  # CORREÇÃO: Adicionada a importação de timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
@@ -240,3 +240,5 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
     except Exception as e:
         logger.error(f"❌ Erro inesperado ao processar NF-e: {e}", exc_info=True)
         return False
+
+# CORREÇÃO: Removido o "}" extra que estava aqui causando um erro de sintaxe.
