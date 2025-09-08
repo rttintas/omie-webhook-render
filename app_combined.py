@@ -1,7 +1,7 @@
 import base64
 import json
 import logging
-from datetime import datetime, timedelta  # CORREÇÃO: Adicionada a importação de timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
@@ -19,8 +19,6 @@ OMIE_TIMEOUT_SECONDS = 30.0
 
 
 # --- 2. Funções Auxiliares (substitua com suas implementações reais) ---
-# Estas são funções que seu código original utiliza.
-# Coloquei implementações de exemplo para o código ser coeso.
 
 async def _omie_post(client: httpx.AsyncClient, url: str, call: str, payload: Dict) -> Dict:
     # Esta função deve encapsular sua lógica de chamada à API Omie,
@@ -99,7 +97,6 @@ async def _buscar_conteudo_xml_via_api(client: httpx.AsyncClient, chave: str, da
             logger.info(f"🔎 Buscando XML para chave {chave} na API - Página {pagina}...")
             resp = await _omie_post(client, OMIE_XML_URL, OMIE_XML_LIST_CALL, payload)
             
-            # A resposta pode ter a lista de documentos em uma chave variável
             documentos = next((v for v in resp.values() if isinstance(v, list)), [])
 
             def _get_api_value(doc, *keys):
@@ -109,18 +106,15 @@ async def _buscar_conteudo_xml_via_api(client: httpx.AsyncClient, chave: str, da
                 return None
             
             for documento in documentos:
-                # Na API, a chave da NFe vem no campo "nChave"
                 chave_doc = _get_api_value(documento, "nChave") 
                 
                 if chave_doc and chave_doc == chave:
-                    # A API retorna o CONTEÚDO do XML no campo "cXml"
                     xml_content = _get_api_value(documento, "cXml")
                     
                     if xml_content:
                         logger.info(f"✅ XML da NF-e {chave} encontrado diretamente na resposta da API (Página {pagina}).")
-                        return xml_content  # Retorna o CONTEÚDO do XML
+                        return xml_content
 
-            # Lógica de paginação baseada na documentação
             total_paginas = resp.get("nTotPáginas")
             if total_paginas and pagina >= int(total_paginas):
                 logger.info(f"Fim da busca na API, total de páginas ({total_paginas}) atingido.")
@@ -161,9 +155,6 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
         xml_text = None
         xml_content_bytes = None
 
-        # --- LÓGICA ROBUSTA PARA OBTER O XML ---
-        
-        # 1. Tenta baixar o XML pela URL (se fornecida pelo webhook)
         if xml_url:
             try:
                 logger.info(f"Baixando XML da URL fornecida para NF-e {chave}...")
@@ -173,36 +164,29 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
                 xml_content_bytes = r.content
             except Exception as e:
                 logger.error(f"❌ Falha ao baixar XML da URL: {e}. Tentando busca alternativa via API.")
-                xml_url = None # Limpa a URL para forçar a busca na API
+                xml_url = None
 
-        # 2. Se não conseguiu pela URL, busca o CONTEÚDO na API
         if not xml_text:
             logger.warning("⚠️ NF-e sem XML — tentando buscar conteúdo via API Contador/XML…")
             xml_text = await _buscar_conteudo_xml_via_api(client, chave, data_emis)
             if xml_text:
                 xml_content_bytes = xml_text.encode('utf-8')
 
-        # 3. Se ainda não tem o XML, falha o processamento
         if not xml_text:
             logger.warning("❌ NF-e segue sem conteúdo XML após todas as tentativas — não será possível salvar.")
             return False
 
-        # --- PROCESSAMENTO E SALVAMENTO NO BANCO ---
-
         try:
             logger.info(f"✅ Conteúdo XML para a NF-e {chave} obtido com sucesso. Processando...")
             
-            # Limpeza do XML para armazenamento
             cleaned_xml = ' '.join(xml_text.replace('\r', '').replace('\n', ' ').split())
             
-            # Codificação em Base64 para armazenamento
             xml_base64 = base64.b64encode(xml_content_bytes).decode("utf-8")
             
         except Exception as e:
             logger.error(f"❌ Erro ao processar o conteúdo do XML: {e}")
             return False
 
-        # Salva na tabela principal (omie_nfe)
         await conn.execute("""
             INSERT INTO public.omie_nfe
                 (chave_nfe, numero, serie, emitida_em, cnpj_emitente, status, xml, xml_url, danfe_url, last_event_at, updated_at, recebido_em, raw)
@@ -222,7 +206,6 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
         """, chave, numero_nf, serie, data_emis, cnpj_emit, status, cleaned_xml, xml_url, danfe_url,
         json.dumps(payload, ensure_ascii=False, default=str))
 
-        # Salva na tabela de XMLs (omie_nfe_xml)
         await conn.execute("""
             INSERT INTO public.omie_nfe_xml (chave_nfe, numero, serie, emitida_em, xml_base64, recebido_em, created_at, updated_at)
             VALUES ($1,$2,$3,$4,$5,now(),now(),now())
@@ -240,5 +223,3 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
     except Exception as e:
         logger.error(f"❌ Erro inesperado ao processar NF-e: {e}", exc_info=True)
         return False
-
-# CORREÇÃO: Removido o "}" extra que estava aqui causando um erro de sintaxe.
