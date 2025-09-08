@@ -89,10 +89,10 @@ def _parse_dt(v: Any) -> Optional[datetime]:
     if not v: return None
     if isinstance(v, datetime): return v
     try:
-        # Tenta parsear datas no formato "DD/MM/YYYY"
+        # Tenta parsear datas no formato "DD/MM/YYYY" que podem vir da API
         if "/" in str(v):
             return datetime.strptime(str(v), "%d/%m/%Y")
-        # Tenta parsear datas no formato ISO (padrão da API)
+        # Tenta parsear datas no formato ISO (padrão de webhooks)
         return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except Exception:
         return None
@@ -100,7 +100,7 @@ def _parse_dt(v: Any) -> Optional[datetime]:
 def _date_range_for_omie(data_emis: Optional[datetime]) -> Tuple[str, str]:
     """
     Retorna datas no formato DD/MM/YYYY para a API Omie.
-    Usa um intervalo de 3 dias para garantir a captura da nota.
+    Usa um intervalo de 3 dias para garantir a captura da nota em caso de latência.
     """
     if data_emis:
         start = (data_emis - timedelta(days=3)).strftime("%d/%m/%Y")
@@ -166,8 +166,8 @@ async def _omie_post_with_retry(client: httpx.AsyncClient, url: str, call: str, 
                 raise
         except Exception as e:
             if attempt < max_retries - 1:
-                logger.warning(f⚠️ Erro na tentativa {attempt + 1}: {e}")
-                await asyncio.sleep(10 * (attempt + 1))  # Backoff
+                logger.warning(f"⚠️ Erro na tentativa {attempt + 1}: {e}")
+                await asyncio.sleep(10 * (attempt + 1))
                 continue
             else:
                 logger.error(f"❌ Unexpected error in _omie_post: {e}")
@@ -195,6 +195,7 @@ def _get_value(doc, *possible_keys):
 # DDL
 # ------------------------------------------------------------------------------
 async def _ensure_tables(conn: asyncpg.Connection) -> None:
+    # Tabela de eventos de webhook (fila)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           bigserial PRIMARY KEY,
@@ -213,6 +214,7 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
         error        text
     );""")
 
+    # Tabela para Pedidos de Venda
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_pedido (
         id_pedido_omie   bigint PRIMARY KEY,
@@ -226,6 +228,7 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
         updated_at       timestamptz
     );""")
 
+    # Tabela para Notas Fiscais (NF-e)
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe (
         chave_nfe         text PRIMARY KEY,
@@ -243,18 +246,6 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
         updated_at        timestamptz,
         recebido_em       timestamptz DEFAULT now(),
         raw               jsonb
-    );""")
-
-    await conn.execute("""
-    CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
-        chave_nfe   text PRIMARY KEY,
-        numero      text,
-        serie       text,
-        emitida_em  timestamptz,
-        xml_base64  text,
-        recebido_em timestamptz DEFAULT now(),
-        created_at  timestamptz DEFAULT now(),
-        updated_at  timestamptz
     );""")
 
 # ------------------------------------------------------------------------------
@@ -316,7 +307,7 @@ async def nfe_webhook(request: Request, token: str = Query(...)):
 # NF-e helpers
 # ------------------------------------------------------------------------------
 
-# ===== FUNÇÃO ATUALIZADA =====
+# ===== FUNÇÃO CORRIGIDA E LIMPA =====
 async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], client: httpx.AsyncClient) -> bool:
     """
     Processa um evento de NF-e, busca os dados na API Omie e salva cada
@@ -363,16 +354,16 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
             if not chave_nfe:
                 continue # Pula item sem chave
 
-            # Mapeamento para as colunas da SUA tabela
+            # Mapeamento para as colunas da sua tabela
             numero_nf = _get_value(doc, "nNumero")
             serie_nf = _get_value(doc, "cSerie")
             status_nf = _get_value(doc, "cStatus")
             valor_nf = doc.get("nValor")
-            data_emissao_nf = _parse_dt(_get_value(doc, "dEmissao")) # A API retorna "dEmissao"
+            data_emissao_nf = _parse_dt(doc.get("dEmissao")) # A API retorna "dEmissao"
             xml_str = doc.get("cXml")
             json_completo_str = json.dumps(doc, ensure_ascii=False, default=str)
             
-            # A API ListarDocumentos não retorna URLs de XML/DANFE, então salvamos como Nulo
+            # A API ListarDocumentos não retorna URLs, então salvamos como Nulo
             danfe_url_nf = None
             xml_url_nf = None
             
@@ -460,6 +451,7 @@ async def run_jobs(secret: str = Query(...)):
                                 entries.append({"nfe_ok": ev_id})
                             else:
                                 errors += 1
+                                # Marca o evento como processado para não tentar de novo infinitamente
                                 await conn.execute("UPDATE public.omie_webhook_events SET error=$1, processed=true, processed_at=now() WHERE id=$2", 'Erro no processar_nfe', ev_id)
                                 entries.append({"nfe_error": ev_id})
                             continue
