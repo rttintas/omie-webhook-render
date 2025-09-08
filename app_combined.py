@@ -1,19 +1,88 @@
-async def _buscar_links_xml_via_api(client: httpx.AsyncClient, chave: str, data_emis: Optional[datetime]) -> Tuple[Optional[str], Optional[str]]:
+import base64
+import json
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+
+import asyncpg
+import httpx
+
+# --- 1. Configurações e Constantes (ajuste com seus valores) ---
+
+# Configure o logger conforme seu ambiente
+logger = logging.getLogger("app_combined")
+
+# Suas constantes da Omie (substitua pelos valores reais)
+OMIE_XML_URL = "https://app.omie.com.br/api/v1/contador/xml/"
+OMIE_XML_LIST_CALL = "ListarDocumentos"
+OMIE_TIMEOUT_SECONDS = 30.0
+
+
+# --- 2. Funções Auxiliares (substitua com suas implementações reais) ---
+# Estas são funções que seu código original utiliza.
+# Coloquei implementações de exemplo para o código ser coeso.
+
+async def _omie_post(client: httpx.AsyncClient, url: str, call: str, payload: Dict) -> Dict:
+    # Esta função deve encapsular sua lógica de chamada à API Omie,
+    # incluindo app_key e app_secret.
+    # Exemplo:
+    # app_key = "SEU_APP_KEY"
+    # app_secret = "SEU_APP_SECRET"
+    # request_data = {"call": call, "param": [payload], "app_key": app_key, "app_secret": app_secret}
+    # response = await client.post(url, json=request_data, timeout=OMIE_TIMEOUT_SECONDS)
+    # response.raise_for_status()
+    # return response.json()
+    logger.info(f"Simulando _omie_post para call: {call} com payload: {payload}")
+    # Retorno simulado para fins de exemplo
+    return {"nTotPáginas": 0, "documentos": []}
+
+def _pick(data: Dict, *keys: str) -> Any:
+    """Retorna o primeiro valor não nulo para uma lista de chaves."""
+    for key in keys:
+        if key in data and data[key]:
+            return data[key]
+    return None
+
+def _safe_text(value: Any) -> Optional[str]:
+    """Converte um valor para string de forma segura."""
+    return str(value).strip() if value is not None else None
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    """Converte uma string de data para um objeto datetime."""
+    if not value:
+        return None
+    try:
+        # Tenta formatos comuns
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+def _date_range_for_omie(dt: Optional[datetime]) -> Tuple[str, str]:
+    """Cria um intervalo de datas no formato D/M/AAAA para a API Omie."""
+    if not dt:
+        dt = datetime.now()
+    # Exemplo simples: pega o primeiro e último dia do mês
+    first_day = dt.replace(day=1)
+    last_day = (first_day.replace(month=first_day.month % 12 + 1, day=1) - timedelta(days=1))
+    return first_day.strftime("%d/%m/%Y"), last_day.strftime("%d/%m/%Y")
+
+
+# --- 3. Lógica Principal Corrigida ---
+
+async def _buscar_conteudo_xml_via_api(client: httpx.AsyncClient, chave: str, data_emis: Optional[datetime]) -> Optional[str]:
     """
-    Consulta a API Contador/XML → ListarDocumentos com paginação até encontrar a NF-e específica
+    Consulta a API Contador/XML -> ListarDocumentos e retorna o CONTEÚDO do XML da NF-e específica.
     """
-    # Extrai mês/ano da chave NFe (formato: ANO+MES+...)
     if not data_emis and chave and len(chave) >= 4:
         try:
-            ano = int(chave[2:4])  # 25 de 352509...
-            mes = int(chave[4:6])  # 09 de 352509...
+            ano = int(chave[2:4])
+            mes = int(chave[4:6])
             data_emis = datetime(2000 + ano, mes, 1)
         except (ValueError, IndexError):
             pass
     
     dEmiInicial, dEmiFinal = _date_range_for_omie(data_emis)
     
-    # Busca com paginação até encontrar a NF-e
     pagina = 1
     registros_por_pagina = 50
     
@@ -27,102 +96,113 @@ async def _buscar_links_xml_via_api(client: httpx.AsyncClient, chave: str, data_
         }
         
         try:
-            logger.info(f"🔎 Buscando XML para chave {chave} - Página {pagina}...")
+            logger.info(f"🔎 Buscando XML para chave {chave} na API - Página {pagina}...")
             resp = await _omie_post(client, OMIE_XML_URL, OMIE_XML_LIST_CALL, payload)
             
-            # Procura na lista de documentos (chave pode variar)
-            documentos = []
-            if isinstance(resp, dict):
-                for key, value in resp.items():
-                    if isinstance(value, list) and any('chave' in str(item) for item in value):
-                        documentos.extend(value)
-                        break
-            
-            # Função auxiliar para extrair valores
-            def _get_value(doc, *possible_keys):
-                if not isinstance(doc, dict):
-                    return None
-                for key in possible_keys:
-                    if key in doc and doc[key] not in (None, "", 0):
-                        return str(doc[key]).strip()
+            # A resposta pode ter a lista de documentos em uma chave variável
+            documentos = next((v for v in resp.values() if isinstance(v, list)), [])
+
+            def _get_api_value(doc, *keys):
+                if not isinstance(doc, dict): return None
+                for key in keys:
+                    if key in doc and doc[key]: return str(doc[key]).strip()
                 return None
             
-            # Busca específica pela chave exata
             for documento in documentos:
-                chave_doc = _get_value(documento, "chave", "chaveNFe", "nfe_chave", "cChaveNFe", "nChave")
+                # Na API, a chave da NFe vem no campo "nChave"
+                chave_doc = _get_api_value(documento, "nChave") 
                 
                 if chave_doc and chave_doc == chave:
-                    xml_url = _get_value(documento, "xml_url", "url_xml", "nfe_xml", "link_xml")
-                    danfe_url = _get_value(documento, "danfe_url", "url_danfe", "nfe_danfe", "link_danfe")
+                    # A API retorna o CONTEÚDO do XML no campo "cXml"
+                    xml_content = _get_api_value(documento, "cXml")
                     
-                    if xml_url:
-                        logger.info(f"✅ NF-e {chave} encontrada na página {pagina}")
-                        return xml_url, danfe_url
-            
-            # Verifica se há mais páginas
-            total_registros = _get_value(resp, "nTotRegistros", "total_registros", "nTotalRegistros")
-            if total_registros and pagina * registros_por_pagina >= int(total_registros):
+                    if xml_content:
+                        logger.info(f"✅ XML da NF-e {chave} encontrado diretamente na resposta da API (Página {pagina}).")
+                        return xml_content  # Retorna o CONTEÚDO do XML
+
+            # Lógica de paginação baseada na documentação
+            total_paginas = resp.get("nTotPáginas")
+            if total_paginas and pagina >= int(total_paginas):
+                logger.info(f"Fim da busca na API, total de páginas ({total_paginas}) atingido.")
                 break
                 
             pagina += 1
             
         except Exception as e:
-            logger.error(f"❌ Erro ao buscar na página {pagina}: {e}")
+            logger.error(f"❌ Erro ao buscar na página {pagina} da API: {e}")
             break
     
-    logger.warning(f"⚠️ NF-e {chave} não encontrada nas {pagina-1} páginas")
-    return None, None
+    logger.warning(f"⚠️ NF-e {chave} não encontrada na busca via API após {pagina-1} páginas.")
+    return None
 
 async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], client: httpx.AsyncClient) -> bool:
     """
-    Processa uma NF-e específica com tratamento robusto do XML
+    Processa uma NF-e específica com tratamento robusto para obter o XML,
+    seja por URL (webhook) ou por conteúdo direto (API).
     """
     try:
         event = payload.get("event", {}) or {}
         
-        chave = _safe_text(_pick(event, "nfe_chave", "chave", "chaveNFe", "chave_nfe"))
-        numero_nf = _safe_text(_pick(event, "id_nf", "numero", "numero_nfe", "nNumero"))
+        chave = _safe_text(_pick(event, "nfe_chave", "chave", "chaveNFe"))
+        numero_nf = _safe_text(_pick(event, "id_nf", "numero_nf", "nNumero"))
         serie = _safe_text(_pick(event, "serie", "cSerie"))
-        data_emis = _parse_dt(_pick(event, "data_emis", "dh_emis", "dhEmissao", "dEmissao"))
-        xml_url = _safe_text(_pick(event, "nfe_xml", "xml_url", "url_xml", "link_xml"))
-        danfe_url = _safe_text(_pick(event, "nfe_danfe", "danfe_url", "url_danfe", "link_danfe"))
-        cnpj_emit = _safe_text(_pick(event, "empresa_cnpj", "cnpj_emitente", "CNPJEmit"))
-        status = _safe_text(_pick(event, "acao", "status", "cStatus"))
+        data_emis = _parse_dt(_pick(event, "data_emis", "dhEmissao", "dEmissao"))
+        xml_url = _safe_text(_pick(event, "nfe_xml", "xml_url"))
+        danfe_url = _safe_text(_pick(event, "nfe_danfe", "danfe_url"))
+        cnpj_emit = _safe_text(_pick(event, "empresa_cnpj", "cnpj_emitente"))
+        status = _safe_text(_pick(event, "acao", "status"))
 
         logger.info(f"🔍 Processando NF-e: Chave={chave}, Número={numero_nf}")
 
         if not chave:
-            logger.warning("❌ NF-e sem chave")
+            logger.warning("❌ NF-e sem chave no payload, impossível continuar.")
             return False
 
-        if not xml_url:
-            logger.warning("⚠️  NF-e sem URL do XML — tentando buscar via Contador/XML …")
-            xml_url_api, danfe_url_api = await _buscar_links_xml_via_api(client, chave, data_emis)
-            xml_url = xml_url or xml_url_api
-            danfe_url = danfe_url or danfe_url_api
+        xml_text = None
+        xml_content_bytes = None
 
-        if not xml_url:
-            logger.warning("❌ NF-e segue sem URL do XML — não será possível salvar.")
+        # --- LÓGICA ROBUSTA PARA OBTER O XML ---
+        
+        # 1. Tenta baixar o XML pela URL (se fornecida pelo webhook)
+        if xml_url:
+            try:
+                logger.info(f"Baixando XML da URL fornecida para NF-e {chave}...")
+                r = await client.get(xml_url, timeout=OMIE_TIMEOUT_SECONDS)
+                r.raise_for_status()
+                xml_text = r.text
+                xml_content_bytes = r.content
+            except Exception as e:
+                logger.error(f"❌ Falha ao baixar XML da URL: {e}. Tentando busca alternativa via API.")
+                xml_url = None # Limpa a URL para forçar a busca na API
+
+        # 2. Se não conseguiu pela URL, busca o CONTEÚDO na API
+        if not xml_text:
+            logger.warning("⚠️ NF-e sem XML — tentando buscar conteúdo via API Contador/XML…")
+            xml_text = await _buscar_conteudo_xml_via_api(client, chave, data_emis)
+            if xml_text:
+                xml_content_bytes = xml_text.encode('utf-8')
+
+        # 3. Se ainda não tem o XML, falha o processamento
+        if not xml_text:
+            logger.warning("❌ NF-e segue sem conteúdo XML após todas as tentativas — não será possível salvar.")
             return False
+
+        # --- PROCESSAMENTO E SALVAMENTO NO BANCO ---
 
         try:
-            # Baixa e limpa o XML
-            r = await client.get(xml_url, timeout=OMIE_TIMEOUT_SECONDS)
-            r.raise_for_status()
+            logger.info(f"✅ Conteúdo XML para a NF-e {chave} obtido com sucesso. Processando...")
             
-            # Limpeza básica do XML (remove caracteres problemáticos)
-            xml_text = r.text
-            xml_text = xml_text.replace('\r', '').replace('\n', ' ').strip()
-            xml_text = ' '.join(xml_text.split())  # Remove espaços múltiplos
+            # Limpeza do XML para armazenamento
+            cleaned_xml = ' '.join(xml_text.replace('\r', '').replace('\n', ' ').split())
             
-            xml_base64 = base64.b64encode(r.content).decode("utf-8")
-            logger.info(f"✅ XML baixado e limpo para NF-e {chave}")
+            # Codificação em Base64 para armazenamento
+            xml_base64 = base64.b64encode(xml_content_bytes).decode("utf-8")
             
         except Exception as e:
-            logger.error(f"❌ Erro ao baixar/limpar XML: {e}")
+            logger.error(f"❌ Erro ao processar o conteúdo do XML: {e}")
             return False
 
-        # Salva no banco (mesmo código anterior)
+        # Salva na tabela principal (omie_nfe)
         await conn.execute("""
             INSERT INTO public.omie_nfe
                 (chave_nfe, numero, serie, emitida_em, cnpj_emitente, status, xml, xml_url, danfe_url, last_event_at, updated_at, recebido_em, raw)
@@ -139,9 +219,10 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
                 last_event_at = now(),
                 updated_at    = now(),
                 raw           = EXCLUDED.raw;
-        """, chave, numero_nf, serie, data_emis, cnpj_emit, status, xml_text, xml_url, danfe_url,
+        """, chave, numero_nf, serie, data_emis, cnpj_emit, status, cleaned_xml, xml_url, danfe_url,
         json.dumps(payload, ensure_ascii=False, default=str))
 
+        # Salva na tabela de XMLs (omie_nfe_xml)
         await conn.execute("""
             INSERT INTO public.omie_nfe_xml (chave_nfe, numero, serie, emitida_em, xml_base64, recebido_em, created_at, updated_at)
             VALUES ($1,$2,$3,$4,$5,now(),now(),now())
@@ -153,9 +234,9 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], clien
                 updated_at = now();
         """, chave, numero_nf, serie, data_emis, xml_base64)
 
-        logger.info(f"✅ NF-e {chave} salva no banco")
+        logger.info(f"✅ NF-e {chave} salva no banco de dados.")
         return True
 
     except Exception as e:
-        logger.error(f"❌ Erro ao processar NF-e: {e}")
+        logger.error(f"❌ Erro inesperado ao processar NF-e: {e}", exc_info=True)
         return False
