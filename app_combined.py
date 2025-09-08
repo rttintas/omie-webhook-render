@@ -89,17 +89,22 @@ def _parse_dt(v: Any) -> Optional[datetime]:
     if not v: return None
     if isinstance(v, datetime): return v
     try:
+        # Tenta parsear datas no formato "DD/MM/YYYY"
+        if "/" in str(v):
+            return datetime.strptime(str(v), "%d/%m/%Y")
+        # Tenta parsear datas no formato ISO (padrão da API)
         return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except Exception:
         return None
 
 def _date_range_for_omie(data_emis: Optional[datetime]) -> Tuple[str, str]:
     """
-    Retorna datas no formato DD/MM/YYYY para a API Omie
+    Retorna datas no formato DD/MM/YYYY para a API Omie.
+    Usa um intervalo de 3 dias para garantir a captura da nota.
     """
     if data_emis:
-        start = (data_emis - timedelta(days=1)).strftime("%d/%m/%Y")
-        end = (data_emis + timedelta(days=1)).strftime("%d/%m/%Y")
+        start = (data_emis - timedelta(days=3)).strftime("%d/%m/%Y")
+        end = (data_emis + timedelta(days=3)).strftime("%d/%m/%Y")
     else:
         end = (_now_utc() + timedelta(days=NFE_LOOKAHEAD_DAYS)).strftime("%d/%m/%Y")
         start = (_now_utc() - timedelta(days=NFE_LOOKBACK_DAYS)).strftime("%d/%m/%Y")
@@ -123,7 +128,6 @@ async def _omie_post_with_retry(client: httpx.AsyncClient, url: str, call: str, 
     
     for attempt in range(max_retries):
         try:
-            # Rate limiting - espera entre requisições
             current_time = time.time()
             elapsed = current_time - LAST_API_CALL_TIME
             if elapsed < OMIE_RATE_LIMIT_DELAY:
@@ -139,11 +143,9 @@ async def _omie_post_with_retry(client: httpx.AsyncClient, url: str, call: str, 
             
             logger.info(f"📥 Response status: {res.status_code}")
             
-            # Trata erro 425 (consumo indevido)
             if res.status_code == 425:
                 error_data = res.json()
                 retry_after = _extract_retry_time(error_data.get("faultstring", ""))
-                
                 logger.warning(f"⏳ API bloqueada. Retentando em {retry_after} segundos...")
                 await asyncio.sleep(retry_after)
                 continue
@@ -155,7 +157,6 @@ async def _omie_post_with_retry(client: httpx.AsyncClient, url: str, call: str, 
             if e.response.status_code == 425 and attempt < max_retries - 1:
                 error_data = e.response.json()
                 retry_after = _extract_retry_time(error_data.get("faultstring", ""))
-                
                 logger.warning(f"⏳ API bloqueada (425). Tentativa {attempt + 1}/{max_retries}")
                 await asyncio.sleep(retry_after)
                 continue
@@ -165,7 +166,7 @@ async def _omie_post_with_retry(client: httpx.AsyncClient, url: str, call: str, 
                 raise
         except Exception as e:
             if attempt < max_retries - 1:
-                logger.warning(f"⚠️ Erro na tentativa {attempt + 1}: {e}")
+                logger.warning(f⚠️ Erro na tentativa {attempt + 1}: {e}")
                 await asyncio.sleep(10 * (attempt + 1))  # Backoff
                 continue
             else:
@@ -273,7 +274,7 @@ async def healthz():
 # ------------------------------------------------------------------------------
 @router.post("/omie/webhook")
 async def pedidos_webhook(request: Request, token: str = Query(...)):
-    logger.info(f"📥 Webhook recebido com token: {token}")
+    logger.info(f"📥 Webhook de Pedido recebido com token: {token}")
     if token != WEBHOOK_TOKEN_PED:
         logger.error(f"❌ Token inválido: Recebido '{token}', Esperado '{WEBHOOK_TOKEN_PED}'")
         raise HTTPException(status_code=403, detail="invalid token")
@@ -314,170 +315,93 @@ async def nfe_webhook(request: Request, token: str = Query(...)):
 # ------------------------------------------------------------------------------
 # NF-e helpers
 # ------------------------------------------------------------------------------
-async def _buscar_links_xml_via_api(client: httpx.AsyncClient, chave: str, data_emis: Optional[datetime]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Consulta a API Contador/XML → ListarDocumentos para encontrar UMA NF-e específica
-    """
-    # Extrai data da chave se não for fornecida
-    if not data_emis and chave and len(chave) >= 6:
-        try:
-            ano = int(chave[2:4])  # 25 de 352509...
-            mes = int(chave[4:6])  # 09 de 352509...
-            data_emis = datetime(2000 + ano, mes, 15)
-            logger.info(f"📅 Data extraída da chave: {data_emis.strftime('%d/%m/%Y')}")
-        except (ValueError, IndexError):
-            pass
-    
-    dEmiInicial, dEmiFinal = _date_range_for_omie(data_emis)
-    
-    logger.info(f"🔍 Buscando NF-e {chave} no período {dEmiInicial} a {dEmiFinal}")
-    
-    # PAYLOAD simplificado
-    payload = {
-        "nPagina": 1,
-        "nRegPorPagina": 50,
-        "cModelo": "55",
-        "dEmiInicial": dEmiInicial,
-        "dEmiFinal": dEmiFinal
-    }
-    
-    try:
-        logger.info(f"📄 Consultando API Omie...")
-        resp = await _omie_post_with_retry(client, OMIE_XML_URL, OMIE_XML_LIST_CALL, payload)
-        
-        # Procura em todas as listas possíveis da resposta
-        documentos = []
-        if isinstance(resp, dict):
-            for key, value in resp.items():
-                if isinstance(value, list):
-                    documentos.extend(value)
-                    logger.info(f"📋 Encontrados {len(value)} documentos em '{key}'")
-        
-        # Busca inteligente pela chave
-        for doc in documentos:
-            if not isinstance(doc, dict):
-                continue
-            
-            # Verifica todos os campos possíveis que podem conter a chave
-            chave_encontrada = None
-            for campo in ["chave", "chaveNFe", "nfe_chave", "cChaveNFe", "nChave"]:
-                if campo in doc and doc[campo]:
-                    chave_candidate = str(doc[campo]).strip()
-                    if chave_candidate == chave:
-                        chave_encontrada = chave_candidate
-                        break
-            
-            if chave_encontrada:
-                # Encontrou a NF-e, agora busca os URLs
-                xml_url = None
-                danfe_url = None
-                
-                for campo_xml in ["xml_url", "url_xml", "nfe_xml", "link_xml"]:
-                    if campo_xml in doc and doc[campo_xml]:
-                        xml_url = str(doc[campo_xml])
-                        break
-                
-                for campo_danfe in ["danfe_url", "url_danfe", "nfe_danfe", "link_danfe"]:
-                    if campo_danfe in doc and doc[campo_danfe]:
-                        danfe_url = str(doc[campo_danfe])
-                        break
-                
-                if xml_url:
-                    logger.info(f"✅ NF-e {chave} encontrada!")
-                    return xml_url, danfe_url
-        
-        logger.warning(f"⚠️ NF-e {chave} não encontrada na resposta da API")
-        return None, None
-        
-    except Exception as e:
-        logger.error(f"❌ Erro ao consultar API Omie: {e}")
-        return None, None
 
+# ===== FUNÇÃO ATUALIZADA =====
 async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any], client: httpx.AsyncClient) -> bool:
     """
-    Processa uma NF-e específica usando a chave como identificador único
+    Processa um evento de NF-e, busca os dados na API Omie e salva cada
+    documento na tabela 'omie_nfe' com as colunas corretas.
     """
     try:
-        event = payload.get("event", {}) or {}
+        event_payload = payload.get("event", {}) or {}
+        logger.info("🔍 Processando gatilho de NF-e...")
+
+        # Tenta pegar data do webhook, senão, extrai da chave como plano B
+        data_evento = _parse_dt(_pick(event_payload, "data_emis", "dh_emis", "dEmissao"))
+        chave_webhook = _safe_text(_pick(event_payload, "nfe_chave", "chave", "chaveNFe"))
+
+        if not data_evento and chave_webhook:
+            try:
+                ano = int(chave_webhook[2:4])
+                mes = int(chave_webhook[4:6])
+                data_evento = datetime(2000 + ano, mes, 15)
+                logger.info(f"📅 Usando data extraída da chave: {data_evento.strftime('%d/%m/%Y')}")
+            except Exception:
+                pass
+
+        # Monta a chamada para buscar o bloco de dados na API
+        dEmiInicial, dEmiFinal = _date_range_for_omie(data_evento)
         
-        chave = _safe_text(_pick(event, "nfe_chave", "chave", "chaveNFe", "chave_nfe"))
-        numero_nf = _safe_text(_pick(event, "id_nf", "numero", "numero_nfe", "nNumero"))
-        serie = _safe_text(_pick(event, "serie", "cSerie"))
-        data_emis = _parse_dt(_pick(event, "data_emis", "dh_emis", "dhEmissao", "dEmissao"))
-        xml_url = _safe_text(_pick(event, "nfe_xml", "xml_url", "url_xml", "link_xml"))
-        danfe_url = _safe_text(_pick(event, "nfe_danfe", "danfe_url", "url_danfe", "link_danfe"))
-        cnpj_emit = _safe_text(_pick(event, "empresa_cnpj", "cnpj_emitente", "CNPJEmit"))
-        status = _safe_text(_pick(event, "acao", "status", "cStatus"))
+        api_payload = {
+            "nPagina": 1, "nRegPorPagina": 100, "cModelo": "55",
+            "dEmiInicial": dEmiInicial, "dEmiFinal": dEmiFinal
+        }
 
-        logger.info(f"🔍 Processando NF-e: Chave={chave}, Número={numero_nf}")
+        logger.info(f"📄 Consultando API Omie para NF-e no período de {dEmiInicial} a {dEmiFinal}...")
+        response_data = await _omie_post_with_retry(client, OMIE_XML_URL, "ListarDocumentos", api_payload)
 
-        if not chave:
-            logger.warning("❌ NF-e sem chave")
-            return False
+        documentos = response_data.get("documentosEncontrados", [])
+        if not documentos:
+            logger.warning("⚠️ Nenhum documento NF-e encontrado na API para o período.")
+            return True # Sucesso, pois não há o que processar
 
-        if not xml_url:
-            logger.warning("⚠️  NF-e sem URL do XML — tentando buscar via Contador/XML …")
-            xml_url_api, danfe_url_api = await _buscar_links_xml_via_api(client, chave, data_emis)
-            xml_url = xml_url or xml_url_api
-            danfe_url = danfe_url or danfe_url_api
+        logger.info(f"✅ Encontrados {len(documentos)} documentos. Salvando no banco...")
 
-        if not xml_url:
-            logger.warning("❌ NF-e segue sem URL do XML — não será possível salvar.")
-            return False
+        # Loop para salvar CADA documento encontrado
+        for doc in documentos:
+            chave_nfe = _get_value(doc, "nChave", "chaveNFe", "chave_nfe")
+            if not chave_nfe:
+                continue # Pula item sem chave
 
-        try:
-            # Baixa e limpa o XML
-            r = await client.get(xml_url, timeout=OMIE_TIMEOUT_SECONDS)
-            r.raise_for_status()
+            # Mapeamento para as colunas da SUA tabela
+            numero_nf = _get_value(doc, "nNumero")
+            serie_nf = _get_value(doc, "cSerie")
+            status_nf = _get_value(doc, "cStatus")
+            valor_nf = doc.get("nValor")
+            data_emissao_nf = _parse_dt(_get_value(doc, "dEmissao")) # A API retorna "dEmissao"
+            xml_str = doc.get("cXml")
+            json_completo_str = json.dumps(doc, ensure_ascii=False, default=str)
             
-            # Limpeza básica do XML
-            xml_text = r.text
-            xml_text = xml_text.replace('\r', '').replace('\n', ' ').strip()
-            xml_text = ' '.join(xml_text.split())
+            # A API ListarDocumentos não retorna URLs de XML/DANFE, então salvamos como Nulo
+            danfe_url_nf = None
+            xml_url_nf = None
             
-            xml_base64 = base64.b64encode(r.content).decode("utf-8")
-            logger.info(f"✅ XML baixado e limpo para NF-e {chave}")
+            await conn.execute("""
+                INSERT INTO public.omie_nfe (
+                    chave_nfe, numero, serie, status, valor_total, emitida_em,
+                    xml, danfe_url, xml_url, raw, last_event_at, updated_at, recebido_em
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now(), now())
+                ON CONFLICT (chave_nfe) DO UPDATE SET
+                    numero = EXCLUDED.numero,
+                    serie = EXCLUDED.serie,
+                    status = EXCLUDED.status,
+                    valor_total = EXCLUDED.valor_total,
+                    emitida_em = EXCLUDED.emitida_em,
+                    xml = EXCLUDED.xml,
+                    danfe_url = COALESCE(EXCLUDED.danfe_url, omie_nfe.danfe_url),
+                    xml_url = COALESCE(EXCLUDED.xml_url, omie_nfe.xml_url),
+                    raw = EXCLUDED.raw,
+                    updated_at = now();
+            """, chave_nfe, numero_nf, serie_nf, status_nf, valor_nf, data_emissao_nf,
+                 xml_str, danfe_url_nf, xml_url_nf, json_completo_str)
             
-        except Exception as e:
-            logger.error(f"❌ Erro ao baixar/limpar XML: {e}")
-            return False
+            logger.info(f"✔️ NF-e Chave: {chave_nfe} (Número: {numero_nf}) salva/atualizada na tabela omie_nfe.")
 
-        # Salva no banco
-        await conn.execute("""
-            INSERT INTO public.omie_nfe
-                (chave_nfe, numero, serie, emitida_em, cnpj_emitente, status, xml, xml_url, danfe_url, last_event_at, updated_at, recebido_em, raw)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now(),now(),$10)
-            ON CONFLICT (chave_nfe) DO UPDATE SET
-                numero        = EXCLUDED.numero,
-                serie         = COALESCE(EXCLUDED.serie, omie_nfe.serie),
-                emitida_em    = COALESCE(EXCLUDED.emitida_em, omie_nfe.emitida_em),
-                cnpj_emitente = COALESCE(EXCLUDED.cnpj_emitente, omie_nfe.cnpj_emitente),
-                status        = COALESCE(EXCLUDED.status, omie_nfe.status),
-                xml           = EXCLUDED.xml,
-                xml_url       = EXCLUDED.xml_url,
-                danfe_url     = COALESCE(EXCLUDED.danfe_url, omie_nfe.danfe_url),
-                last_event_at = now(),
-                updated_at    = now(),
-                raw           = EXCLUDED.raw;
-        """, chave, numero_nf, serie, data_emis, cnpj_emit, status, xml_text, xml_url, danfe_url,
-        json.dumps(payload, ensure_ascii=False, default=str))
-
-        await conn.execute("""
-            INSERT INTO public.omie_nfe_xml (chave_nfe, numero, serie, emitida_em, xml_base64, recebido_em, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,now(),now(),now())
-            ON CONFLICT (chave_nfe) DO UPDATE SET
-                numero     = EXCLUDED.numero,
-                serie      = COALESCE(EXCLUDED.serie, omie_nfe_xml.serie),
-                emitida_em = COALESCE(EXCLUDED.emitida_em, omie_nfe_xml.emitida_em),
-                xml_base64 = EXCLUDED.xml_base64,
-                updated_at = now();
-        """, chave, numero_nf, serie, data_emis, xml_base64)
-
-        logger.info(f"✅ NF-e {chave} salva no banco")
         return True
 
     except Exception as e:
-        logger.error(f"❌ Erro ao processar NF-e: {e}")
+        logger.error(f"❌ Erro fatal ao processar e gravar NF-e: {e}", exc_info=True)
         return False
 
 # ------------------------------------------------------------------------------
@@ -536,6 +460,7 @@ async def run_jobs(secret: str = Query(...)):
                                 entries.append({"nfe_ok": ev_id})
                             else:
                                 errors += 1
+                                await conn.execute("UPDATE public.omie_webhook_events SET error=$1, processed=true, processed_at=now() WHERE id=$2", 'Erro no processar_nfe', ev_id)
                                 entries.append({"nfe_error": ev_id})
                             continue
 
