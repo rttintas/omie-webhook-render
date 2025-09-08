@@ -2,7 +2,6 @@
 import os
 import json
 import logging
-import base64
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -31,17 +30,18 @@ OMIE_APP_KEY = os.getenv("OMIE_APP_KEY", "")
 OMIE_APP_SECRET = os.getenv("OMIE_APP_SECRET", "")
 OMIE_TIMEOUT_SECONDS = int(os.getenv("OMIE_TIMEOUT_SECONDS", "30"))
 
+# Endpoints Omie
 OMIE_PEDIDO_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 OMIE_XML_URL = "https://app.omie.com.br/api/v1/contador/xml/"
 OMIE_XML_LIST_CALL = "ListarDocumentos"
 
-# comportamento
+# Comportamento
 ENRICH_PEDIDO_IMEDIATO = True
 NFE_LOOKBACK_DAYS = 7
 NFE_LOOKAHEAD_DAYS = 1
 
 # ------------------------------------------------------------------------------
-# App
+# App / Pool
 # ------------------------------------------------------------------------------
 router = APIRouter()
 
@@ -85,7 +85,7 @@ def _parse_dt(v: Any) -> Optional[datetime]:
     if not v: return None
     if isinstance(v, datetime): return v
     try:
-        # Omie manda ISO com timezone: "2025-09-06T00:00:00-03:00"
+        # "2025-09-06T00:00:00-03:00" ou "2025-09-06T00:00:00Z"
         return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except Exception:
         return None
@@ -100,7 +100,7 @@ def _date_range_for_omie(data_emis: Optional[datetime]) -> Tuple[datetime, datet
     return start, end
 
 def _fmt_br_date(d: datetime) -> str:
-    # dd/mm/YYYY
+    # dd/mm/YYYY em UTC para a API Omie
     return d.astimezone(timezone.utc).strftime("%d/%m/%Y")
 
 def _build_omie_body(call: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,10 +116,10 @@ async def _omie_post(client: httpx.AsyncClient, url: str, call: str, payload: Di
     return j
 
 # ------------------------------------------------------------------------------
-# DDL  (cria/ajusta sem quebrar a estrutura que você já tem)
+# DDL (idempotente; não quebra sua estrutura existente)
 # ------------------------------------------------------------------------------
 async def _ensure_tables(conn: asyncpg.Connection) -> None:
-    # fila de eventos
+    # Fila de eventos
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_webhook_events (
         id           bigserial PRIMARY KEY,
@@ -138,7 +138,7 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
     );
     """)
 
-    # tabela principal de NFe (mantém suas colunas)
+    # Tabela NF-e principal
     await conn.execute("""
     CREATE TABLE IF NOT EXISTS public.omie_nfe (
         chave_nfe         text PRIMARY KEY,
@@ -167,16 +167,45 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
     );
     """)
 
-    # adiciona colunas novas se faltarem (idempotente)
-    for col, ddl in [
-        ("xml_text",          "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS xml_text text"),
-        ("pdf_url",           "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS pdf_url text"),
-        ("data_emissao",      "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS data_emissao text"),
-        ("created_at",        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()"),
-        ("id_nf",             "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS id_nf int8"),
-        ("id_pedido",         "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS id_pedido int8"),
-        ("cliente_nome",      "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS cliente_nome text"),
-        ("chave",             "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS chave text")
+    # Tabela auxiliar (XML em base64 – opcional)
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS public.omie_nfe_xml (
+        chave_nfe   text PRIMARY KEY,
+        numero      text,
+        serie       text,
+        emitida_em  timestamptz,
+        xml_base64  text,
+        recebido_em timestamptz DEFAULT now(),
+        created_at  timestamptz DEFAULT now(),
+        updated_at  timestamptz
+    );
+    """)
+
+    # Tabela de pedidos (usada quando enriquecemos)
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS public.omie_pedido (
+        id_pedido_omie   bigint PRIMARY KEY,
+        numero           text,
+        valor_total      numeric(15,2),
+        situacao         text,
+        quantidade_itens int4,
+        cliente_codigo   text,
+        detalhe          jsonb,
+        created_at       timestamptz DEFAULT now(),
+        updated_at       timestamptz
+    );
+    """)
+
+    # Colunas extras (idempotente)
+    for ddl in [
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS xml_text text",
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS pdf_url text",
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS data_emissao text",
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now()",
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS id_nf int8",
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS id_pedido int8",
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS cliente_nome text",
+        "ALTER TABLE public.omie_nfe ADD COLUMN IF NOT EXISTS chave text"
     ]:
         await conn.execute(ddl)
 
@@ -195,7 +224,7 @@ async def healthz():
         return {"ok": False, "error": str(e)}
 
 # ------------------------------------------------------------------------------
-# WEBHOOKS: Pedido & NF-e
+# WEBHOOKS
 # ------------------------------------------------------------------------------
 @router.post("/omie/webhook")
 async def pedidos_webhook(request: Request, token: str = Query(...)):
@@ -232,12 +261,12 @@ async def nfe_webhook(request: Request, token: str = Query(...)):
     return JSONResponse({"ok": True})
 
 # ------------------------------------------------------------------------------
-# NF-e: helpers (Contador/XML e parse do XML)
+# NF-e helpers
 # ------------------------------------------------------------------------------
 async def _fetch_xml_via_contador(client: httpx.AsyncClient, chave: str, data_emis: Optional[datetime]) -> Optional[Dict[str, Any]]:
     """
-    Tenta obter o XML pelo endpoint Contador/XML (ListarDocumentos), retornando
-    o item que **bate a chave**. Retorna dict com possíveis campos (cXml, nNumero, cSerie, nValor, cStatus).
+    Consulta Contador/XML → ListarDocumentos, filtrando por faixa de data,
+    e retorna somente o item cuja chave bater com a do webhook.
     """
     start_dt, end_dt = _date_range_for_omie(data_emis)
     payload = {
@@ -247,58 +276,45 @@ async def _fetch_xml_via_contador(client: httpx.AsyncClient, chave: str, data_em
         "dEmiInicial": _fmt_br_date(start_dt),
         "dEmiFinal": _fmt_br_date(end_dt),
     }
-    logger.info(f"🔎 Buscando XML via Contador/XML.ListarDocumentos {payload!r} …")
-
+    logger.info(f"🔎 Buscando via Contador/XML.ListarDocumentos: {payload!r}")
     try:
         j = await _omie_post(client, OMIE_XML_URL, OMIE_XML_LIST_CALL, payload)
     except Exception as e:
         logger.warning(f"⚠️  Falha ao consultar Contador/XML: {e}")
         return None
 
-    # lista pode vir em várias chaves; normalizamos
-    itens = []
+    itens: List[Dict[str, Any]] = []
     for k in ("documentos", "lista", "documento", "lista_documentos"):
         v = j.get(k)
         if isinstance(v, list):
             itens = v
             break
 
-    # filtra pela chave
     for it in itens:
-        nChave = _safe_text(it.get("nChave"))
-        if not nChave:
-            # tentar dentro do cXml
-            cx = _safe_text(it.get("cXml"))
-            if cx and (f"<chNFe>{chave}</chNFe>" in cx or f'Id="NFe{chave}"' in cx):
-                return it
-        elif nChave == chave:
+        nChave = _safe_text(it.get("nChave")) or _safe_text(it.get("chave")) or _safe_text(it.get("chaveNFe"))
+        if nChave == chave:
             return it
-
+        cx = _safe_text(it.get("cXml"))
+        if cx and (f"<chNFe>{chave}</chNFe>" in cx or f'Id="NFe{chave}"' in cx):
+            return it
     return None
 
 def _parse_xml_fields(xml_text: str) -> Dict[str, Any]:
-    """
-    Extrai dados úteis do XML da NF-e.
-    """
+    """Extrai alguns campos úteis do XML da NF-e."""
     out: Dict[str, Any] = {}
     try:
         ns = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
         root = ET.fromstring(xml_text)
-
-        # tenta achar nó NFe dentro de nfeProc
         nfe_node = root.find(".//nfe:NFe", ns) or root
 
-        # destinatário
         cnpj_node = nfe_node.find(".//nfe:dest/nfe:CNPJ", ns) or nfe_node.find(".//nfe:dest/nfe:CPF", ns)
         if cnpj_node is not None and cnpj_node.text:
             out["cnpj_destinatario"] = cnpj_node.text.strip()
 
-        # nome do cliente
         xnome_node = nfe_node.find(".//nfe:dest/nfe:xNome", ns)
         if xnome_node is not None and xnome_node.text:
             out["cliente_nome"] = xnome_node.text.strip()
 
-        # valor total vNF
         vnf_node = nfe_node.find(".//nfe:total/nfe:ICMSTot/nfe:vNF", ns)
         if vnf_node is not None and vnf_node.text:
             try:
@@ -314,14 +330,15 @@ def _parse_xml_fields(xml_text: str) -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bool:
     """
-    Processa uma NF-e e salva/atualiza em public.omie_nfe (chave_nfe = PK).
+    Processa e persiste a NF-e em public.omie_nfe (PK = chave_nfe).
+    Salva mesmo sem XML; se o XML aparecer depois, atualiza.
     """
     try:
         event = payload.get("event", {}) or payload.get("evento", {}) or {}
         chave = _safe_text(event.get("nfe_chave"))
         numero_nf = _safe_text(event.get("numero_nf"))
         serie = _safe_text(event.get("série")) or _safe_text(event.get("serie"))
-        data_emis_text = _safe_text(event.get("data_emis")) or _safe_text(event.get("data_emis"))
+        data_emis_text = _safe_text(event.get("data_emis"))
         data_emis = _parse_dt(data_emis_text)
         xml_url = _safe_text(event.get("nfe_xml"))
         danfe_url = _safe_text(event.get("nfe_danfe"))
@@ -338,39 +355,35 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bo
 
         xml_text: Optional[str] = None
 
-        # 1) Tenta pelo link do webhook
+        # 1) tenta pelo link do webhook
         if xml_url:
             try:
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(xml_url, timeout=30)
                     resp.raise_for_status()
                     xml_text = resp.text
-                    logger.info(f"✅ XML baixado do link do webhook.")
+                    logger.info("✅ XML baixado do link do webhook.")
             except Exception as e:
-                logger.warning(f"Falha ao baixar XML pelo link do webhook: {e}")
+                logger.warning(f"Falha ao baixar XML do link do webhook: {e}")
 
-        # 2) Se não conseguiu, tenta Contador/XML pela chave
+        # 2) se não conseguiu, tenta Contador/XML (comparando a chave)
         if not xml_text:
             async with httpx.AsyncClient(timeout=OMIE_TIMEOUT_SECONDS) as client:
                 item = await _fetch_xml_via_contador(client, chave, data_emis)
                 if item:
-                    xml_text = _safe_text(item.get("cXml")) or None
-                    # aproveitar campos auxiliares
+                    xml_text = _safe_text(item.get("cXml"))
                     numero_nf = _safe_text(item.get("nNumero")) or numero_nf
                     serie     = _safe_text(item.get("cSerie"))  or serie
                     status    = _safe_text(item.get("cStatus")) or status
                     try:
                         v = item.get("nValor")
-                        if v is not None:
-                            valor_total_hint = float(v)
-                        else:
-                            valor_total_hint = None
+                        valor_total_hint = float(v) if v is not None else None
                     except Exception:
                         valor_total_hint = None
                 else:
-                    logger.warning("⚠️  Não foi possível localizar a NF-e por Contador/XML para esta chave.")
+                    valor_total_hint = None
 
-        # 3) enriquecer a partir do XML (se obtido)
+        # 3) enriquecer com XML (se tiver)
         cnpj_dest = None
         cliente_nome = None
         valor_total = None
@@ -380,11 +393,10 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bo
             cliente_nome = enrich.get("cliente_nome")
             valor_total = enrich.get("valor_total")
 
-        # fallback de valor_total vindo do contador
         if not valor_total and 'valor_total_hint' in locals():
-            valor_total = locals()['valor_total_hint']
+            valor_total = valor_total_hint
 
-        # 4) UPSERT na public.omie_nfe (sempre salva, mesmo que sem XML)
+        # 4) UPSERT na tabela principal (salva mesmo sem XML)
         await conn.execute(
             """
             INSERT INTO public.omie_nfe
@@ -421,26 +433,41 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bo
               cliente_nome      = COALESCE(EXCLUDED.cliente_nome,      public.omie_nfe.cliente_nome),
               chave             = COALESCE(EXCLUDED.chave,             public.omie_nfe.chave)
             """,
-            # params
             chave,
             _safe_text(numero_nf),
             _safe_text(serie),
             data_emis,
-            data_emis_text,
+            _safe_text(data_emis_text),
             _safe_text(cnpj_emit),
             _safe_text(cnpj_dest),
             valor_total,
             _safe_text(status),
-            None if not xml_text else xml_text,    # xml (se quiser duplicar xml_text)
+            None if not xml_text else xml_text,   # xml
             xml_text,
             xml_url,
             danfe_url,
-            danfe_url or xml_url,                  # pdf_url (pode ser o mesmo do danfe)
+            danfe_url or xml_url,
             json.dumps(payload),
             int(id_nf) if _safe_text(id_nf) else None,
             int(id_pedido) if _safe_text(id_pedido) else None,
             _safe_text(cliente_nome),
         )
+
+        # Tabela auxiliar com XML em base64 (só se houver XML)
+        if xml_text:
+            await conn.execute(
+                """
+                INSERT INTO public.omie_nfe_xml (chave_nfe, numero, serie, emitida_em, xml_base64, recebido_em, created_at, updated_at)
+                VALUES ($1,$2,$3,$4,$5,now(),now(),now())
+                ON CONFLICT (chave_nfe) DO UPDATE SET
+                  numero     = COALESCE(EXCLUDED.numero,      public.omie_nfe_xml.numero),
+                  serie      = COALESCE(EXCLUDED.serie,       public.omie_nfe_xml.serie),
+                  emitida_em = COALESCE(EXCLUDED.emitida_em,  public.omie_nfe_xml.emitida_em),
+                  xml_base64 = EXCLUDED.xml_base64,
+                  updated_at = now()
+                """,
+                chave, _safe_text(numero_nf), _safe_text(serie), data_emis, xml_text.encode("utf-8").hex()
+            )
 
         logger.info(f"✅ NF-e {chave} salva/atualizada em public.omie_nfe")
         return True
@@ -450,7 +477,7 @@ async def processar_nfe(conn: asyncpg.Connection, payload: Dict[str, Any]) -> bo
         return False
 
 # ------------------------------------------------------------------------------
-# Pedido (consulta imediata só quando habilitado)
+# Pedido
 # ------------------------------------------------------------------------------
 async def _consultar_pedido(client: httpx.AsyncClient, codigo_pedido: int) -> Dict[str, Any]:
     payload = {"codigo_pedido": codigo_pedido}
@@ -523,29 +550,16 @@ async def run_jobs(secret: str = Query(...)):
                                 try:
                                     data = await _consultar_pedido(client, codigo_pedido)
                                     pedido_venda = data.get("pedido_venda_produto", {})
-                                    cabecalho = pedido_venda.get("cabecalho", {})
+                                    cab = pedido_venda.get("cabecalho", {}) or {}
 
-                                    numero = _safe_text(_pick(cabecalho, "numero_pedido", "numero"))
-                                    valor_total = _pick(cabecalho, "valor_total", "valor_mercadorias")
-                                    situacao = _safe_text(_pick(cabecalho, "etapa", "situacao"))
-                                    cliente_codigo = _safe_text(_pick(cabecalho, "codigo_cliente"))
+                                    numero = _safe_text(_pick(cab, "numero_pedido", "numero"))
+                                    valor_total = _pick(cab, "valor_total", "valor_mercadorias")
+                                    situacao = _safe_text(_pick(cab, "etapa", "situacao"))
+                                    cliente_codigo = _safe_text(_pick(cab, "codigo_cliente"))
 
-                                    detalhes = pedido_venda.get("det", [])
-                                    quantidade_itens = len(detalhes) if isinstance(detalhes, list) else 0
+                                    det = pedido_venda.get("det", [])
+                                    quantidade_itens = len(det) if isinstance(det, list) else 0
 
-                                    await conn.execute("""
-                                        CREATE TABLE IF NOT EXISTS public.omie_pedido (
-                                            id_pedido_omie   bigint PRIMARY KEY,
-                                            numero           text,
-                                            valor_total      numeric(15,2),
-                                            situacao         text,
-                                            quantidade_itens int4,
-                                            cliente_codigo   text,
-                                            detalhe          jsonb,
-                                            created_at       timestamptz DEFAULT now(),
-                                            updated_at       timestamptz
-                                        );
-                                    """)
                                     await conn.execute("""
                                         INSERT INTO public.omie_pedido
                                           (id_pedido_omie, numero, valor_total, situacao, quantidade_itens, cliente_codigo, detalhe, created_at, updated_at)
@@ -568,7 +582,7 @@ async def run_jobs(secret: str = Query(...)):
                             log.append({"pedido_ok": codigo_pedido, "event_id": ev_id})
                             continue
 
-                        # Rota desconhecida: apenas marca como processado
+                        # rota desconhecida
                         await conn.execute("UPDATE public.omie_webhook_events SET processed=true, processed_at=now() WHERE id=$1", ev_id)
                         processed += 1
                         log.append({"evento_processado": ev_id, "rota": route})
